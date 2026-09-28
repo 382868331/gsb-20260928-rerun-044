@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statplatform"
+version = "0.1.0"
+description = "带批次记录、数据版本、可暂停恢复的统计试验运行平台（首项能力：分组结构数据置换检验）"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+statplatform = "statplatform.cli:main"
+
+[tool.setuptools]
+packages = ["statplatform"]

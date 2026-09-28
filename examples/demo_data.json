@@ -1,0 +1,13 @@
+{
+  "name": "paired_demo",
+  "version": "1.0.0",
+  "group_col": "subject",
+  "label_col": "condition",
+  "value_col": "y",
+  "rows": [
+    {"subject": "s1", "condition": "treat", "y": 5.0},
+    {"subject": "s1", "condition": "ctrl",  "y": 1.0},
+    {"subject": "s2", "condition": "treat", "y": 4.0},
+    {"subject": "s2", "condition": "ctrl",  "y": 2.0}
+  ]
+}
