@@ -1,0 +1,5 @@
+group,condition,value
+A,control,1
+A,treatment,3
+B,control,2
+B,treatment,4
