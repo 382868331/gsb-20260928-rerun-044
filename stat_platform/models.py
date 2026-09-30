@@ -62,6 +62,9 @@ class PermutationResult:
     adaptive: bool = False
     looks: int = 0
     stopped_reason: str | None = None
+    decision: str | None = None
+    design: dict[str, Any] | None = None
+    look_log: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -82,6 +85,9 @@ class PermutationResult:
             "adaptive": self.adaptive,
             "looks": self.looks,
             "stopped_reason": self.stopped_reason,
+            "decision": self.decision,
+            "design": self.design,
+            "look_log": list(self.look_log),
         }
         return result
 

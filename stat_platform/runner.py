@@ -11,6 +11,7 @@ from typing import Any, Sequence
 from .adjustment import adjust
 from .models import Dataset, PermutationResult, TestResult, TestSpec
 from .permutation import AssignmentRecord, GroupedPermutationTest
+from .sequential import SequentialDesign, build_design, default_looks
 from .storage import JsonStore, connect, dumps, loads
 
 
@@ -120,8 +121,13 @@ class PlatformRunner:
         max_new_samples: int | None = None,
     ) -> TestResult:
         if max_new_samples is None:
-            while self.advance_test(test_id) is None:
-                pass
+            # Each advance runs through one chunk or one planned look; for a
+            # sequential test this keeps advancing between looks transparently
+            # without creating decisions at non-look boundaries.
+            while True:
+                result = self.advance_test(test_id)
+                if result is not None:
+                    break
             return self.get_result(test_id)
         result = self.advance_test(test_id, max_new_samples=max_new_samples)
         if result is None:
@@ -211,8 +217,11 @@ class PlatformRunner:
         test_id = int(test["id"])
         batch_id = int(test["batch_id"])
         stopping = engine.stopping_settings()
-        adaptive = stopping.get("type", "fixed") != "fixed"
-        cap = stopping.get("max_samples") if adaptive else None
+        rule = stopping.get("type", "fixed")
+        adaptive = rule != "fixed"
+        design = self._load_design(state, stopping, engine.total_assignments)
+        look_schedule = design.looks if design is not None else None
+        cap = design.max_samples if design is not None else stopping.get("max_samples")
         target = min(
             int(cap) if cap is not None else int(test["samples"]),
             engine.total_assignments,
@@ -221,9 +230,21 @@ class PlatformRunner:
         hits = int(state["as_extreme_count"])
         looks = int(state.get("looks", 0))
 
-        want = target - evaluated
+        # With a pre-planned design the stopping rule is evaluated only at a
+        # planned look; chunks between looks are merely persisted, so they can
+        # never create an unplanned (invalid) decision.
+        advance_limit = target
+        if look_schedule is not None:
+            next_look = next(
+                (count for count in look_schedule if count > evaluated),
+                look_schedule[-1],
+            )
+            advance_limit = min(target, next_look)
+        want = advance_limit - evaluated
         if max_new_samples is not None:
             want = min(want, max_new_samples)
+        else:
+            want = advance_limit - evaluated
         pool = self._ensure_pool(batch_id, engine, evaluated + max(want, 0))
 
         records: list[AssignmentRecord] = []
@@ -238,10 +259,34 @@ class PlatformRunner:
 
         self._append_samples(test_id, evaluated - produced, records)
 
-        stopped_reason = engine.check_stopping(evaluated, hits) if adaptive else None
-        if adaptive:
+        stopped_reason = None
+        decision = None
+        look_log = list(loads(state.get("look_log_json") or "[]"))
+        at_look = look_schedule is not None and evaluated in set(look_schedule)
+        if at_look:
             looks += 1
+            if rule == "ci-half-width":
+                # Estimation-precision target: this produces a narrow interval
+                # but is never a significance decision and carries no decision
+                # error guarantee across looks.
+                entry = self._ci_look_entry(evaluated, hits, stopping)
+                entry["look"] = looks
+                look_log.append(entry)
+                if entry["precision_target_met"]:
+                    stopped_reason = "ci-half-width"
+            elif design is not None:
+                decision = design.evaluate(evaluated, hits)
+                entry = design.progress(evaluated, hits)
+                entry["look"] = looks
+                look_log.append(entry)
+                if decision is not None:
+                    stopped_reason = f"decided-{decision}"
+
         complete = evaluated >= target or stopped_reason is not None
+        if complete and adaptive and stopped_reason is None:
+            # Budget exhausted while still inside the continuation region: the
+            # decision is honestly reported as inconclusive, never forced.
+            stopped_reason = "inconclusive-max-samples"
 
         batch_state = self.store.find_one("batch_states", batch_id=batch_id)
         state.update(
@@ -250,6 +295,8 @@ class PlatformRunner:
                 "as_extreme_count": hits,
                 "random_draws": int(batch_state["random_draws"]),
                 "looks": looks,
+                "look_log_json": dumps(look_log),
+                "design_json": dumps(design.to_dict()) if design is not None else None,
             }
         )
         self.store.commit()
@@ -273,10 +320,17 @@ class PlatformRunner:
             ),
             as_extreme_count=hits,
             seed=self._pool_seed(batch_id),
-            stopping_rule=stopping.get("type", "fixed"),
+            stopping_rule=rule,
             adaptive=adaptive,
             looks=looks,
-            stopped_reason=stopped_reason or ("max-samples" if evaluated >= target and adaptive else None),
+            stopped_reason=(
+                stopped_reason
+                if stopped_reason is not None
+                else ("max-samples" if evaluated >= target and rule == "ci-half-width" else None)
+            ),
+            decision=decision if design is not None else None,
+            design=design.to_dict() if design is not None else None,
+            look_log=tuple(look_log),
         )
         self.store.insert(
             "test_results",
@@ -284,6 +338,83 @@ class PlatformRunner:
         )
         self.store.commit()
         return self._test_result(test_id, result)
+
+    @staticmethod
+    def _load_design(
+        state: dict[str, Any],
+        stopping: dict[str, Any],
+        total_assignments: int | None = None,
+    ) -> SequentialDesign | None:
+        if stopping.get("type") not in {"decision", "ci-half-width"}:
+            return None
+        stored = state.get("design_json")
+        if stored:
+            return SequentialDesign.from_dict(loads(stored))
+        looks = stopping.get("looks")
+        max_samples = int(stopping.get("max_samples") or stopping.get("min_samples") or 1000)
+        if not looks:
+            looks = default_looks(
+                max_samples,
+                int(stopping.get("number_of_looks", 5)),
+                min_samples=int(stopping.get("min_samples", 1) or 1),
+            )
+        looks = tuple(int(count) for count in looks)
+        if total_assignments is not None and looks[-1] > total_assignments:
+            # Project the pre-planned schedule onto the smaller feasible space;
+            # the last permitted check sits at full coverage.
+            looks = tuple(sorted({min(count, total_assignments) for count in looks}))
+        design = build_design(
+            looks,
+            q0=float(stopping.get("alpha", stopping.get("decision_alpha", 0.05))),
+            q_sig=float(stopping.get("q_sig", stopping.get("indifference_p", 0.01))),
+            q_nonsig=float(stopping.get("q_nonsig", stopping.get("indifference_p_high", 0.2))),
+            alpha_significant=float(stopping.get("risk_significant", 0.05)),
+            alpha_not_significant=float(stopping.get("risk_not_significant", 0.05)),
+        )
+        state["design_json"] = dumps(design.to_dict())
+        return design
+
+    @staticmethod
+    def _ci_look_entry(evaluated: int, hits: int, stopping: dict[str, Any]) -> dict[str, Any]:
+        p_value = (hits + 1) / (evaluated + 1)
+        standard_error = math.sqrt(max(0.0, p_value * (1 - p_value) / (evaluated + 2)))
+        half = 1.959963984540054 * standard_error
+        return {
+            "evaluated": evaluated,
+            "as_extreme_count": hits,
+            "current_p_estimate": p_value,
+            "ci_half_width": half,
+            "target_half_width": stopping.get("max_half_width"),
+            "precision_target_met": stopping.get("max_half_width") is not None
+            and half <= float(stopping["max_half_width"]),
+        }
+
+    def peek_test(self, test_id: int) -> dict[str, Any]:
+        """Current evidence and unmet stopping conditions without consuming draws."""
+        test = self.store.find_one("tests", id=test_id)
+        if test is None:
+            raise KeyError(f"unknown test {test_id}")
+        completed_row = self.store.find_one("test_results", test_id=test_id)
+        state = self.store.find_one("run_states", test_id=test_id)
+        evaluated = int(state["evaluated_assignments"])
+        hits = int(state["as_extreme_count"])
+        settings = loads(test["settings_json"])
+        stopping = settings.get("stopping") or {"type": "fixed"}
+        design = self._load_design(state, stopping)
+        entry: dict[str, Any] = {
+            "test_id": test_id,
+            "batch_id": int(test["batch_id"]),
+            "status": "completed" if completed_row is not None else "running",
+            "evaluated": evaluated,
+            "as_extreme_count": hits,
+            "current_p_estimate": (hits + 1) / (evaluated + 1) if evaluated else None,
+            "looks_recorded": int(state.get("looks", 0)),
+            "look_log": list(loads(state.get("look_log_json") or "[]")),
+        }
+        if design is not None:
+            entry["design"] = design.to_dict()
+            entry["next_conditions"] = design.progress(evaluated, hits)
+        return entry
 
     def _pool_seed(self, batch_id: int) -> int | None:
         batch = self.store.find_one("batches", id=batch_id)
@@ -384,14 +515,60 @@ class PlatformRunner:
                     else None,
                     "adjusted_confidence_level": adjusted_level,
                     "adjusted_confidence_interval": adjusted_interval,
+                    "individual_decision": item.result.decision,
+                    "individual_meaning": self._individual_meaning(item.result),
                 }
             )
+        family_rejected = [entry for entry in entries if entry["adjusted_reject"]]
+        decided = [entry for entry in entries if entry["individual_decision"] is not None]
+        family = {
+            "number_of_tests": m,
+            "rule": rule,
+            "family_wise_alpha": alpha,
+            "family_rejected_count": len(family_rejected),
+            "family_rejected_test_ids": [entry["test_id"] for entry in family_rejected],
+            "all_individual_decisions_made": len(decided) == m,
+            "undecided_test_ids": [
+                entry["test_id"]
+                for entry in entries
+                if entry["individual_decision"] is None and entry["adaptive"]
+            ],
+            "meaning": (
+                "Per-test entries judge each null hypothesis separately at its own "
+                "pre-planned decision risk; adjusted_reject additionally controls the "
+                f"family-wise error over all {m} tests under shared (possibly dependent) "
+                "permutations using the " + rule + " rule. A family claim that at least "
+                "one null is false requires an adjusted rejection; it does not imply the "
+                "other hypotheses are false."
+            ),
+        }
         return {
             "batch_id": batch_id,
             "rule": rule,
             "alpha": alpha,
             "tests": entries,
+            "family": family,
         }
+
+    @staticmethod
+    def _individual_meaning(result: PermutationResult) -> str:
+        if not result.adaptive or result.decision is None:
+            return (
+                "No risk-controlled individual decision: the value is a fixed-budget "
+                "Monte Carlo estimate and its interval cannot be interpreted as valid "
+                "at arbitrary inspection times."
+            )
+        if result.decision == "significant":
+            return (
+                "Reject this null under the pre-planned look schedule; the exact "
+                "probability of this declaration at the decision boundary is bounded "
+                "by risk_significant_at_q0 in design."
+            )
+        return (
+            "Do not reject this null under the pre-planned look schedule; the exact "
+            "probability of this declaration at the decision boundary is bounded by "
+            "risk_not_significant_at_q0 in design."
+        )
 
     def get_result(self, test_id: int) -> TestResult:
         row = self.store.find_one("test_results", test_id=test_id)

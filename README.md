@@ -11,7 +11,9 @@
 - Monte Carlo p 值使用 `(as_extreme + 1) / (n + 1)` 保守估计；随机数状态和已见排列落盘，恢复后继续固定随机流且不重复已有样本。
 - 每个检验都保存自己的 `null_hypothesis`，同一批次可扩展多项检验并分别对应原假设。
 - 同一批次内的多项检验共享同一个批次级合法排列池（`batch_assignments`），排列只按批次种子生成一次；每项检验分别记录自己的原假设、统计量、命中计数与停止条件，互不覆盖。
-- 支持可中断的自适应抽样：`--stopping decision`（p 值置信区间整体落在 α 一侧即停）或 `--stopping ci-half-width`（区间半宽达标即停），配合 `--min-samples` / `--max-samples`。自适应结果会记录 `adaptive`、`looks`（重复看结果次数）、`stopping_rule` 与 `stopped_reason`，不会伪装成固定次数试验。
+- 支持**预先固定查看计划与错误风险**的序贯停止：用 `--stopping decision --looks n1 n2 ...`（或 `--num-looks` 自动生成等间距计划）选定允许查看的累计排列数，用 `--risk-significant` / `--risk-not-significant` 选定在决策边界 `q0=α` 处允许的两类错误概率。平台用精确二项动态规划反推每次查看的命中数边界，并报告在 `q0` 处**实际达到的精确错误概率**以及在 `--q-sig`、`--q-nonsig` 处的正确决策把握度（power）。决策只在计划查看点发生；预算耗尽仍落在继续区内时如实记为 `inconclusive-max-samples`，绝不强行下结论。
+- 固定样本的 p 值置信区间只是一次性有效，**不能**在任意时刻反复拿来当停止判据：`--stopping ci-half-width` 仅用于把估计精度做窄，同样只在计划查看点检查，结果不会给出显著性决策保证。
+- 自适应结果记录 `adaptive`、`looks`、`stopping_rule`、`stopped_reason`、`decision`、完整 `design`（边界与精确风险）和每次查看的 `look_log`；用 `stat-platform peek <test_id>` 可在不消耗排列的情况下查看当前证据与“尚未满足的停止条件”。
 - 任意检查点边界保存后恢复，不会重复统计已用排列；排列池内容只取决于批次种子，同一配置下无论各检验的运行先后或分块方式，结果一致。
 
 ## 多重比较
@@ -33,7 +35,31 @@ stat-platform run data.csv --max-exact-assignments 1000 --seed 42 \
 stat-platform resume 1
 ```
 
-`decision` 规则在 p 值 95% 置信区间整体低于 α（`decided-significant`）或整体高于 α（`decided-not-significant`）时提前停止；`ci-half-width` 规则在区间半宽不超过 `--ci-half-width` 时停止；两者都受 `--max-samples` 上限保护。
+Monte Carlo 接受排列中的“命中”次数服从二项分布，平台据此构造成组序贯边界：在第 k 次查看，命中数 `hits <= lower_k` 判 `significant`，`hits >= upper_k` 判 `not-significant`，否则继续。边界先按 Pocock 式等比例花费初算，再整体缩放并用精确 DP 核算，使跨全部查看的越界概率不超过用户允许风险（直接重复套用固定样本区间会把风险放大到名义值以上，例如 4 次查看时约 6.4% > 5%）。
+
+```bash
+stat-platform run data.csv --max-exact-assignments 1000 --seed 42 \
+  --stopping decision --decision-alpha 0.05 \
+  --risk-significant 0.05 --risk-not-significant 0.05 \
+  --q-sig 0.01 --q-nonsig 0.15 \
+  --looks 2000 5000 10000 20000 --max-samples 20000 \
+  --checkpoint-every 700
+stat-platform peek 1
+stat-platform resume 1 --checkpoint-every 700
+```
+
+暂停/恢复只按预算切块持久化：重开不会清零 `looks` 或 `look_log`，共享排列池也不会重复消耗同一排列；分块大小只影响切块，不影响查看点、决策与停止记录。
+
+## 单项与整组结论
+
+同一批次的多项检验共享排列（彼此可能相关），`compare` 同时给出两层含义：
+
+- **单项结论**：每项检验按自己预先固定的计划与风险得到 `individual_decision`（`significant` / `not-significant` / 计划结束仍不确定），只对应该项的原假设。
+- **整组结论**：`adjusted_p_value` / `adjusted_reject` 用 Bonferroni 或 Holm 在共享排列下控制全组族系错误率；“至少一个原假设为假”必须基于调整后拒绝，且不代表其余假设也被拒绝。报告中的 `family` 字段汇总整组拒绝情况、尚未做出单项决策的检验，并明确两层含义。
+
+## 小数据穷举核对
+
+排列空间不超过上限时直接完整枚举并给出精确 p 值；小空间 Monte Carlo 在无放回覆盖全部合法排列后，命中数必须与完整枚举一致。测试用可穷举数据（如 2 组 4 个排列、3 组 8 个排列）核对枚举结果，并用精确 DP 与二项模拟比较不同查看安排下的风险约束，验证不同分块/查看安排产生相同的停止记录。
 
 ## 命令行
 

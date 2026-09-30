@@ -170,32 +170,6 @@ class GroupedPermutationTest:
     def stopping_settings(self) -> dict[str, Any]:
         return dict(self.spec.settings.get("stopping") or {"type": "fixed"})
 
-    def check_stopping(self, evaluated: int, hits: int) -> str | None:
-        """Return a stop reason for adaptive rules, or None to keep sampling."""
-        stopping = self.stopping_settings()
-        rule = stopping.get("type", "fixed")
-        if rule == "fixed":
-            return None
-        min_samples = int(stopping.get("min_samples", 0))
-        max_samples = stopping.get("max_samples")
-        p_value = (hits + 1) / (evaluated + 1)
-        standard_error = math.sqrt(max(0.0, p_value * (1 - p_value) / (evaluated + 2)))
-        z = 1.959963984540054
-        if evaluated >= min_samples:
-            if rule == "ci-half-width" and z * standard_error <= float(
-                stopping["max_half_width"]
-            ):
-                return "ci-half-width"
-            if rule == "decision":
-                alpha = float(stopping.get("alpha", 0.05))
-                if p_value + z * standard_error < alpha:
-                    return "decided-significant"
-                if p_value - z * standard_error > alpha:
-                    return "decided-not-significant"
-        if max_samples is not None and evaluated >= int(max_samples):
-            return "max-samples"
-        return None
-
     def run(
         self,
         *,

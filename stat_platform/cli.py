@@ -49,10 +49,52 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-samples", type=int, default=None)
     run.add_argument("--ci-half-width", type=float, default=None)
     run.add_argument("--decision-alpha", type=float, default=None)
+    run.add_argument(
+        "--looks",
+        type=int,
+        nargs="+",
+        default=None,
+        help="pre-planned cumulative sample counts at which decisions may occur",
+    )
+    run.add_argument(
+        "--num-looks",
+        type=int,
+        default=5,
+        help="number of evenly spaced looks when --looks is not supplied",
+    )
+    run.add_argument(
+        "--risk-significant",
+        type=float,
+        default=0.05,
+        help="allowed exact probability of declaring significant at q0",
+    )
+    run.add_argument(
+        "--risk-not-significant",
+        type=float,
+        default=0.05,
+        help="allowed exact probability of declaring not-significant at q0",
+    )
+    run.add_argument(
+        "--q-sig",
+        type=float,
+        default=0.01,
+        help="true-p level at which significant power is reported (below alpha)",
+    )
+    run.add_argument(
+        "--q-nonsig",
+        type=float,
+        default=0.2,
+        help="true-p level at which not-significant power is reported (above alpha)",
+    )
 
     resume = subparsers.add_parser("resume", help="resume an existing batch")
     resume.add_argument("batch_id", type=int)
     resume.add_argument("--checkpoint-every", type=int, default=None)
+
+    peek = subparsers.add_parser(
+        "peek", help="show current evidence and unmet stopping conditions"
+    )
+    peek.add_argument("test_id", type=int)
 
     compare = subparsers.add_parser(
         "compare", help="unadjusted and adjusted conclusions for one batch"
@@ -83,6 +125,17 @@ def build_stopping(args: argparse.Namespace) -> dict[str, Any]:
         stopping["alpha"] = (
             args.decision_alpha if args.decision_alpha is not None else 0.05
         )
+        stopping["risk_significant"] = args.risk_significant
+        stopping["risk_not_significant"] = args.risk_not_significant
+        stopping["q_sig"] = args.q_sig
+        stopping["q_nonsig"] = args.q_nonsig
+        stopping["number_of_looks"] = args.num_looks
+        if args.looks:
+            stopping["looks"] = list(args.looks)
+    if args.stopping == "ci-half-width":
+        stopping["number_of_looks"] = args.num_looks
+        if args.looks:
+            stopping["looks"] = list(args.looks)
     return stopping
 
 
@@ -166,7 +219,10 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
         else:
-            print(json.dumps(serialize_result(runner.get_result(args.test_id)), ensure_ascii=False, indent=2))
+            if args.command == "peek":
+                print(json.dumps(runner.peek_test(args.test_id), ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(serialize_result(runner.get_result(args.test_id)), ensure_ascii=False, indent=2))
 
 
 def serialize_result(item: object) -> dict[str, Any]:
