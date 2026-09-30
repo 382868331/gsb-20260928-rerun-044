@@ -58,6 +58,10 @@ class PermutationResult:
     confidence_interval: tuple[float, float] | None = None
     as_extreme_count: int = 0
     seed: int | None = None
+    stopping_rule: str = "fixed"
+    adaptive: bool = False
+    looks: int = 0
+    stopped_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -74,6 +78,10 @@ class PermutationResult:
             if self.confidence_interval is not None
             else None,
             "seed": self.seed,
+            "stopping_rule": self.stopping_rule,
+            "adaptive": self.adaptive,
+            "looks": self.looks,
+            "stopped_reason": self.stopped_reason,
         }
         return result
 

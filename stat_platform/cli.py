@@ -39,14 +39,51 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-exact-assignments", type=int, default=100_000)
     run.add_argument("--seed", type=int)
     run.add_argument("--checkpoint-every", type=int, default=None)
+    run.add_argument(
+        "--stopping",
+        choices=("fixed", "ci-half-width", "decision"),
+        default="fixed",
+        help="adaptive stopping rule; non-fixed rules record repeated looks",
+    )
+    run.add_argument("--min-samples", type=int, default=0)
+    run.add_argument("--max-samples", type=int, default=None)
+    run.add_argument("--ci-half-width", type=float, default=None)
+    run.add_argument("--decision-alpha", type=float, default=None)
 
     resume = subparsers.add_parser("resume", help="resume an existing batch")
     resume.add_argument("batch_id", type=int)
     resume.add_argument("--checkpoint-every", type=int, default=None)
 
+    compare = subparsers.add_parser(
+        "compare", help="unadjusted and adjusted conclusions for one batch"
+    )
+    compare.add_argument("batch_id", type=int)
+    compare.add_argument(
+        "--rule", choices=("none", "bonferroni", "holm"), default="holm"
+    )
+    compare.add_argument("--alpha", type=float, default=0.05)
+
     result = subparsers.add_parser("result", help="show a completed test result")
     result.add_argument("test_id", type=int)
     return parser
+
+
+def build_stopping(args: argparse.Namespace) -> dict[str, Any]:
+    stopping: dict[str, Any] = {"type": args.stopping}
+    if args.stopping == "fixed":
+        return stopping
+    stopping["min_samples"] = args.min_samples
+    if args.max_samples is not None:
+        stopping["max_samples"] = args.max_samples
+    if args.stopping == "ci-half-width":
+        if args.ci_half_width is None:
+            raise SystemExit("--ci-half-width is required for ci-half-width stopping")
+        stopping["max_half_width"] = args.ci_half_width
+    if args.stopping == "decision":
+        stopping["alpha"] = (
+            args.decision_alpha if args.decision_alpha is not None else 0.05
+        )
+    return stopping
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -65,6 +102,7 @@ def main(argv: list[str] | None = None) -> None:
             settings: dict[str, Any] = {"alternative": args.alternative}
             if args.conditions:
                 settings["conditions"] = tuple(args.conditions)
+            settings["stopping"] = build_stopping(args)
             spec = TestSpec(
                 test_type=GroupedPermutationTest.test_type,
                 null_hypothesis="Exchangeable condition labels within groups; mean(condition 0) = mean(condition 1).",
@@ -117,6 +155,16 @@ def main(argv: list[str] | None = None) -> None:
                 )
             else:
                 print(json.dumps([serialize_result(item) for item in results], ensure_ascii=False, indent=2))
+        elif args.command == "compare":
+            print(
+                json.dumps(
+                    runner.compare_batch(
+                        args.batch_id, rule=args.rule, alpha=args.alpha
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         else:
             print(json.dumps(serialize_result(runner.get_result(args.test_id)), ensure_ascii=False, indent=2))
 

@@ -11,6 +11,8 @@ EMPTY_DATABASE: dict[str, list[dict[str, Any]]] = {
     "batches": [],
     "tests": [],
     "permutation_samples": [],
+    "batch_assignments": [],
+    "batch_states": [],
     "run_states": [],
     "test_results": [],
 }
