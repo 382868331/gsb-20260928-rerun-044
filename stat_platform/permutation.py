@@ -159,6 +159,62 @@ class GroupedPermutationTest:
         statistic = self._statistic(assignment)
         return AssignmentRecord(tuple(assignment), statistic, self._as_extreme(statistic))
 
+    def iter_all_assignments(self) -> Iterator[tuple[str, ...]]:
+        """Yield every legal assignment in a canonical, deterministic order."""
+        return self._all_arrangements()
+
+    def evaluate_assignment(self, assignment: Sequence[str]) -> AssignmentRecord:
+        """Score one shared legal assignment with this test's own statistic."""
+        return self._record(assignment)
+
+    def draw_random_assignment(self, rng: random.Random) -> tuple[str, ...]:
+        group_arrangements = [
+            rng.sample(labels, k=len(labels)) for labels in self.group_label_sets
+        ]
+        return self._assignment(group_arrangements)
+
+    def monte_carlo_inference(
+        self,
+        hits: int,
+        evaluated: int,
+        *,
+        looks: int = 1,
+    ) -> dict[str, Any]:
+        """Conservative p-value plus uncertainty range for Monte Carlo runs.
+
+        Repeated looks are not treated as a fixed-horizon design: when the
+        look count exceeds one the reported confidence level is Bonferroni
+        widened across looks and the nominal 95% range is kept separately.
+        """
+        from statistics import NormalDist
+
+        p_value = (hits + 1) / (evaluated + 1)
+        standard_error = math.sqrt(max(0.0, p_value * (1 - p_value) / (evaluated + 2)))
+        z95 = 1.959963984540054
+        naive_interval = (
+            min(1.0, max(0.0, p_value - z95 * standard_error)),
+            min(1.0, max(0.0, p_value + z95 * standard_error)),
+        )
+        if looks > 1:
+            confidence_level = 1.0 - 0.05 / looks
+            z = NormalDist().inv_cdf((1.0 + confidence_level) / 2.0)
+            interval = (
+                min(1.0, max(0.0, p_value - z * standard_error)),
+                min(1.0, max(0.0, p_value + z * standard_error)),
+            )
+            unadjusted = naive_interval
+        else:
+            confidence_level = 0.95
+            interval = naive_interval
+            unadjusted = None
+        return {
+            "p_value": p_value,
+            "standard_error": standard_error,
+            "confidence_level": confidence_level,
+            "confidence_interval": interval,
+            "unadjusted_confidence_interval": unadjusted,
+        }
+
     def run(
         self,
         *,

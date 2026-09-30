@@ -58,6 +58,9 @@ class PermutationResult:
     confidence_interval: tuple[float, float] | None = None
     as_extreme_count: int = 0
     seed: int | None = None
+    looks: int = 1
+    stopping_reason: str | None = None
+    unadjusted_confidence_interval: tuple[float, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -72,6 +75,11 @@ class PermutationResult:
             "confidence_level": self.confidence_level,
             "confidence_interval": list(self.confidence_interval)
             if self.confidence_interval is not None
+            else None,
+            "looks": self.looks,
+            "stopping_reason": self.stopping_reason,
+            "unadjusted_confidence_interval": list(self.unadjusted_confidence_interval)
+            if self.unadjusted_confidence_interval is not None
             else None,
             "seed": self.seed,
         }

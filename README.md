@@ -11,6 +11,24 @@
 - Monte Carlo p 值使用 `(as_extreme + 1) / (n + 1)` 保守估计；随机数状态和已见排列落盘，恢复后继续固定随机流且不重复已有样本。
 - 每个检验都保存自己的 `null_hypothesis`，同一批次可扩展多项检验并分别对应原假设。
 
+## 多假设比较与共享排列
+
+- 同一批次内的所有检验共享一张 `batch_permutations` 合法排列表：排列只在批次层面生成并保存一次，每项检验在共享排列上分别计算自己的统计量与极端计数（`permutation_samples` 按检验记录统计量和是否极端）。
+- 批次随机流由批次种子驱动，与检验的创建或运行先后顺序无关；同一配置无论先运行哪项检验，结果完全一致。
+- 每项检验独立记录自己的原假设、统计量设定、目标样本数、查看次数（`looks`）与停止原因（`stopping_reason`：`exact_enumeration` / `target_samples` / `precision_target`）。
+- 自适应抽样：在 `settings["adaptive"]` 中给出 `min_samples` 与 `ci_half_width`，每次推进后若置信区间半宽达标则提前停止。重复查看结果不会被当作普通固定次数试验：`looks > 1` 时报告按查看次数 Bonferroni 加宽的置信区间（`confidence_level = 1 - 0.05/looks`），并在 `unadjusted_confidence_interval` 中保留名义 95% 区间。
+- 批次比较报告同时给出未经调整与按所选规则（`bonferroni` / `holm` / `benjamini-hochberg`）调整后的 p 值与不确定范围：
+
+```bash
+stat-platform compare 1 --method holm --alpha 0.05
+```
+
+向已有批次追加新的假设（资料必须与批次数据一致）：
+
+```bash
+stat-platform add-test 1 data.csv --null "control not greater" --conditions control treatment --alternative less
+```
+
 ## 命令行
 
 ```bash

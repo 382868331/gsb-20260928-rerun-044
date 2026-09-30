@@ -10,6 +10,7 @@ EMPTY_DATABASE: dict[str, list[dict[str, Any]]] = {
     "datasets": [],
     "batches": [],
     "tests": [],
+    "batch_permutations": [],
     "permutation_samples": [],
     "run_states": [],
     "test_results": [],
