@@ -11,8 +11,12 @@
 - Monte Carlo p 值使用 `(as_extreme + 1) / (n + 1)` 保守估计；随机数状态和已见排列落盘，恢复后继续固定随机流且不重复已有样本。
 - 每个检验都保存自己的 `null_hypothesis`，同一批次可扩展多项检验并分别对应原假设。
 - 同一批次内的多项检验共享同一个批次级合法排列池（`batch_assignments`），排列只按批次种子生成一次；每项检验分别记录自己的原假设、统计量、命中计数与停止条件，互不覆盖。
-- 支持可中断的自适应抽样：`--stopping decision`（p 值置信区间整体落在 α 一侧即停）或 `--stopping ci-half-width`（区间半宽达标即停），配合 `--min-samples` / `--max-samples`。自适应结果会记录 `adaptive`、`looks`（重复看结果次数）、`stopping_rule` 与 `stopped_reason`，不会伪装成固定次数试验。
+- 支持**预注册的序贯停止决策**：运行前必须用 `--looks n1 n2 ... nK` 选定全部计划查看点，并预先选定允许的错误风险。停止判定只在这些查看点发生；两次查看之间只展示当前证据（命中数 `hits`、保守 p 估计）和尚未满足的停止条件，监测结果标记 `monitoring_only`，不会被计作一次查看。
+- 序贯设计把每个随机排列视为一次伯努利试验：在查看点 `n_k`，命中数 `S_k <= lower_k` 判 `significant`，`S_k >= upper_k` 判 `not-significant`。边界由精确二项分布配合 α/β 消耗函数（`--spending pocock` 或 `obrien-flanagan`）构造，对多次查看取并集仍有风险上界；平台无放回抽取排列，有限总体下真实风险不超过二项设计风险（超几何随机占优二项）。
+- 风险按无差别区间解释：`--p-high`（默认 0.05，即拒绝阈值）与 `--p-low`（默认 p-high/2）之间是预先声明的无差别区。`sup_{p>=p-high} P(误判显著) <= --epsilon-high`，`sup_{p<=p-low} P(误判不显著) <= --epsilon-low`；末次查看若落在无差别区内，结论为 `inconclusive`，不强行二选一。
+- `--stopping ci-half-width` 仅表示“估计精度达标即停”；其固定样本置信区间不能解释为任意时刻都有效的决策区间。
 - 任意检查点边界保存后恢复，不会重复统计已用排列；排列池内容只取决于批次种子，同一配置下无论各检验的运行先后或分块方式，结果一致。
+- 设计随首次运行落盘（`run_states.design_json`）：暂停/重开不会清零 `looks`、已查看次数或已消耗排列，恢复时以已注册设计为准，不能借重开偷换查看计划。
 
 ## 多重比较
 
@@ -22,18 +26,32 @@
 stat-platform compare 1 --rule holm --alpha 0.05
 ```
 
-`--rule` 可选 `none` / `bonferroni` / `holm`。输出中每项检验同时包含 `unadjusted_p_value` / `unadjusted_reject` 与 `adjusted_p_value` / `adjusted_reject`，以及未调整置信区间和按 Bonferroni 置信度 `1-(1-γ)/m` 加宽后的 `adjusted_confidence_interval`。
+`--rule` 可选 `none` / `bonferroni` / `holm`，输出区分两个层面：
 
-## 自适应抽样
+- `individual_decision`：该单项假设在其**各自预注册错误风险**（`individual_error_risk`）下的结论；
+- `adjusted_decision` / `adjusted_p_value` / `adjusted_reject`：该结论作为**整组家族的一员**在族系水平 `--alpha` 下是否仍成立；
+- `family_wise_conclusion` 给出 `at_least_one_rejected` / `all_rejected` 及文字说明 `meaning`；运行中的检验只报告监测信息（`p_estimate_is_monitoring_only`），不参与整组断言。
+
+未调整 Monte Carlo 区间与按 Bonferroni 置信度 `1-(1-γ)/m` 加宽的 `adjusted_confidence_interval` 只在固定样本完成时是覆盖区间；序贯过程的决策有效性来自停止边界，而不是这些区间。
+
+## 预注册序贯停止
 
 ```bash
 stat-platform run data.csv --max-exact-assignments 1000 --seed 42 \
-  --stopping decision --decision-alpha 0.05 --min-samples 200 --max-samples 5000 \
-  --checkpoint-every 500
+  --stopping sequential-decision \
+  --looks 200 500 1000 2000 5000 \
+  --p-high 0.05 --p-low 0.02 \
+  --epsilon-high 0.05 --epsilon-low 0.05 \
+  --spending pocock --checkpoint-every 500
 stat-platform resume 1
+stat-platform status 1
 ```
 
-`decision` 规则在 p 值 95% 置信区间整体低于 α（`decided-significant`）或整体高于 α（`decided-not-significant`）时提前停止；`ci-half-width` 规则在区间半宽不超过 `--ci-half-width` 时停止；两者都受 `--max-samples` 上限保护。
+判定只在 `--looks` 给定的累计样本数处做出；`status` 可任意次查看而不消耗查看次数，返回当前 `hits`、`p_estimate`、本查看点边界以及 `unmet_conditions`。`ci-half-width` 规则在区间半宽不超过 `--ci-half-width` 时停止，仅供估计用途。
+
+## 风险核对
+
+`finite_population_risks(design, total_assignments, hit_count)` 对有限排列空间做完整状态枚举，精确给出每种真实命中数下判为 `significant` / `not-significant` / `inconclusive` 的概率，用于在可穷举小数据上核对错误风险约束。测试中的 8 排列配对数据还验证：不同分块大小、不同查看安排消费同一排列前缀；恢复不清零查看次数；整组报告区分单项与族系结论。
 
 ## 命令行
 

@@ -129,7 +129,14 @@ def test_interleaved_chunking_matches_sequential_runs(tmp_path: Path):
 
 
 def test_adaptive_stopping_is_recorded_not_treated_as_fixed(tmp_path: Path):
-    stopping = {"type": "decision", "alpha": 0.05, "min_samples": 2, "max_samples": 8}
+    stopping = {
+        "type": "sequential-decision",
+        "looks": [4, 8],
+        "p_high": 0.5,
+        "p_low": 0.1,
+        "epsilon_high": 0.2,
+        "epsilon_low": 0.2,
+    }
     with PlatformRunner(tmp_path / "db.json") as runner:
         batch_id = create_mc_batch(
             runner,
@@ -138,8 +145,13 @@ def test_adaptive_stopping_is_recorded_not_treated_as_fixed(tmp_path: Path):
         adaptive_result, fixed_result = runner.run_batch(batch_id)
 
     assert adaptive_result.result.adaptive is True
-    assert adaptive_result.result.stopping_rule == "decision"
+    assert adaptive_result.result.stopping_rule == "sequential-decision"
     assert adaptive_result.result.looks >= 1
+    assert adaptive_result.result.decision in (
+        "significant",
+        "not-significant",
+        "inconclusive",
+    )
     assert adaptive_result.result.stopped_reason is not None
     assert fixed_result.result.adaptive is False
     assert fixed_result.result.stopped_reason is None

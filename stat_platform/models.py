@@ -62,6 +62,9 @@ class PermutationResult:
     adaptive: bool = False
     looks: int = 0
     stopped_reason: str | None = None
+    decision: str | None = None
+    sequential_design: dict[str, Any] | None = None
+    unmet_conditions: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -82,6 +85,9 @@ class PermutationResult:
             "adaptive": self.adaptive,
             "looks": self.looks,
             "stopped_reason": self.stopped_reason,
+            "decision": self.decision,
+            "sequential_design": self.sequential_design,
+            "unmet_conditions": self.unmet_conditions,
         }
         return result
 

@@ -171,10 +171,15 @@ class GroupedPermutationTest:
         return dict(self.spec.settings.get("stopping") or {"type": "fixed"})
 
     def check_stopping(self, evaluated: int, hits: int) -> str | None:
-        """Return a stop reason for adaptive rules, or None to keep sampling."""
+        """Stop reason for the estimation-only ci-half-width rule.
+
+        Decision-oriented stopping is handled by
+        ``stat_platform.sequential.SequentialDesign``: fixed-sample intervals
+        must not be re-used at arbitrary times as decision boundaries.
+        """
         stopping = self.stopping_settings()
         rule = stopping.get("type", "fixed")
-        if rule == "fixed":
+        if rule in ("fixed", "sequential-decision", "decision"):
             return None
         min_samples = int(stopping.get("min_samples", 0))
         max_samples = stopping.get("max_samples")
@@ -186,12 +191,6 @@ class GroupedPermutationTest:
                 stopping["max_half_width"]
             ):
                 return "ci-half-width"
-            if rule == "decision":
-                alpha = float(stopping.get("alpha", 0.05))
-                if p_value + z * standard_error < alpha:
-                    return "decided-significant"
-                if p_value - z * standard_error > alpha:
-                    return "decided-not-significant"
         if max_samples is not None and evaluated >= int(max_samples):
             return "max-samples"
         return None

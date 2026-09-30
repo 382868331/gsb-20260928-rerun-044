@@ -41,18 +41,41 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--checkpoint-every", type=int, default=None)
     run.add_argument(
         "--stopping",
-        choices=("fixed", "ci-half-width", "decision"),
+        choices=("fixed", "ci-half-width", "sequential-decision"),
         default="fixed",
-        help="adaptive stopping rule; non-fixed rules record repeated looks",
+        help=(
+            "stopping rule; sequential-decision requires pre-registered "
+            "--looks and error budgets"
+        ),
     )
     run.add_argument("--min-samples", type=int, default=0)
     run.add_argument("--max-samples", type=int, default=None)
     run.add_argument("--ci-half-width", type=float, default=None)
-    run.add_argument("--decision-alpha", type=float, default=None)
+    run.add_argument(
+        "--looks",
+        type=int,
+        nargs="+",
+        default=None,
+        help="strictly increasing cumulative sample counts at which decisions may be made",
+    )
+    run.add_argument("--p-high", type=float, default=0.05)
+    run.add_argument("--p-low", type=float, default=None)
+    run.add_argument("--epsilon-high", type=float, default=0.05)
+    run.add_argument("--epsilon-low", type=float, default=0.05)
+    run.add_argument(
+        "--spending",
+        choices=("pocock", "obrien-flanagan"),
+        default="pocock",
+    )
 
     resume = subparsers.add_parser("resume", help="resume an existing batch")
     resume.add_argument("batch_id", type=int)
     resume.add_argument("--checkpoint-every", type=int, default=None)
+
+    status = subparsers.add_parser(
+        "status", help="show current evidence and unmet stopping conditions"
+    )
+    status.add_argument("test_id", type=int)
 
     compare = subparsers.add_parser(
         "compare", help="unadjusted and adjusted conclusions for one batch"
@@ -79,10 +102,23 @@ def build_stopping(args: argparse.Namespace) -> dict[str, Any]:
         if args.ci_half_width is None:
             raise SystemExit("--ci-half-width is required for ci-half-width stopping")
         stopping["max_half_width"] = args.ci_half_width
-    if args.stopping == "decision":
-        stopping["alpha"] = (
-            args.decision_alpha if args.decision_alpha is not None else 0.05
+        return stopping
+    if not args.looks:
+        raise SystemExit(
+            "sequential-decision requires --looks with the pre-selected "
+            "cumulative sample counts (e.g. --looks 200 500 1000)"
         )
+    stopping.update(
+        {
+            "looks": list(args.looks),
+            "p_high": args.p_high,
+            "epsilon_high": args.epsilon_high,
+            "epsilon_low": args.epsilon_low,
+            "spending": args.spending,
+        }
+    )
+    if args.p_low is not None:
+        stopping["p_low"] = args.p_low
     return stopping
 
 
@@ -161,6 +197,14 @@ def main(argv: list[str] | None = None) -> None:
                     runner.compare_batch(
                         args.batch_id, rule=args.rule, alpha=args.alpha
                     ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        elif args.command == "status":
+            print(
+                json.dumps(
+                    runner.test_status(args.test_id),
                     ensure_ascii=False,
                     indent=2,
                 )
