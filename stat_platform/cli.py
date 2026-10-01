@@ -96,6 +96,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     peek.add_argument("test_id", type=int)
 
+    gate = subparsers.add_parser(
+        "gate",
+        help="hierarchical gate report; --set fixes the pre-run plan from JSON",
+    )
+    gate.add_argument("batch_id", type=int)
+    gate.add_argument(
+        "--set",
+        dest="gate_spec",
+        default=None,
+        help="JSON file with alpha, nodes (0-based test positions), and edges",
+    )
+
     compare = subparsers.add_parser(
         "compare", help="unadjusted and adjusted conclusions for one batch"
     )
@@ -208,6 +220,33 @@ def main(argv: list[str] | None = None) -> None:
                 )
             else:
                 print(json.dumps([serialize_result(item) for item in results], ensure_ascii=False, indent=2))
+        elif args.command == "gate":
+            if args.gate_spec is not None:
+                with Path(args.gate_spec).open(encoding="utf-8") as handle:
+                    spec = json.load(handle)
+                test_ids = [
+                    int(row["id"])
+                    for row in sorted(
+                        runner.store.find_many("tests", batch_id=args.batch_id),
+                        key=lambda row: int(row["id"]),
+                    )
+                ]
+                from .gatekeeping import plan_from_positions
+
+                runner.define_gate(
+                    args.batch_id,
+                    plan_from_positions(
+                        alpha=float(spec.get("alpha", 0.05)),
+                        nodes=spec.get("nodes", ()),
+                        test_ids=test_ids,
+                        edges=spec.get("edges", ()),
+                    ),
+                )
+            print(
+                json.dumps(
+                    runner.gate_report(args.batch_id), ensure_ascii=False, indent=2
+                )
+            )
         elif args.command == "compare":
             print(
                 json.dumps(

@@ -9,6 +9,7 @@ from statistics import NormalDist
 from typing import Any, Sequence
 
 from .adjustment import adjust
+from .gatekeeping import GatePlan, plan_from_positions
 from .models import Dataset, PermutationResult, TestResult, TestSpec
 from .permutation import AssignmentRecord, GroupedPermutationTest
 from .sequential import SequentialDesign, build_design, default_looks
@@ -43,6 +44,7 @@ class PlatformRunner:
         samples: int = 10_000,
         max_exact_assignments: int = 100_000,
         seed: int | None = None,
+        gate: dict[str, Any] | None = None,
     ) -> int:
         dataset_id = self._store_dataset(dataset)
         batch_id = self.store.insert(
@@ -57,7 +59,7 @@ class PlatformRunner:
             "batch_states",
             {"batch_id": batch_id, "rng_state_json": None, "random_draws": 0},
         )
-        for spec in specs or ():
+        test_ids = [
             self.add_test(
                 batch_id,
                 spec,
@@ -65,8 +67,142 @@ class PlatformRunner:
                 max_exact_assignments=max_exact_assignments,
                 seed=seed,
             )
+            for spec in specs or ()
+        ]
+        if gate is not None:
+            plan = plan_from_positions(
+                alpha=float(gate.get("alpha", 0.05)),
+                nodes=gate.get("nodes", ()),
+                test_ids=test_ids,
+                edges=gate.get("edges", ()),
+            )
+            self.define_gate(batch_id, plan)
         self.store.commit()
         return batch_id
+
+    def define_gate(self, batch_id: int, plan: GatePlan) -> None:
+        """Fix the pre-run gate plan for a batch.
+
+        The plan must be registered before any test in the batch completes;
+        afterwards the allocation and opening conditions are immutable, so a
+        failed primary can never be bypassed by redefining the follow-ups.
+        """
+        batch = self.store.find_one("batches", id=batch_id)
+        if batch is None:
+            raise KeyError(f"unknown batch {batch_id}")
+        if batch.get("gate_json"):
+            raise ValueError("gate plan is already fixed for this batch")
+        rows = self.store.find_many("tests", batch_id=batch_id)
+        known = {int(row["id"]) for row in rows}
+        planned = {node.test_id for node in plan.nodes}
+        if not planned <= known:
+            raise ValueError(
+                f"gate plan references tests outside the batch: {sorted(planned - known)}"
+            )
+        for row in rows:
+            if self.store.find_one("test_results", test_id=int(row["id"])) is not None:
+                raise ValueError(
+                    "gate plan must be fixed before any test in the batch completes"
+                )
+        batch["gate_json"] = dumps(plan.to_dict())
+        self.store.commit()
+
+    def gate_plan(self, batch_id: int) -> GatePlan | None:
+        batch = self.store.find_one("batches", id=batch_id)
+        if batch is None:
+            raise KeyError(f"unknown batch {batch_id}")
+        stored = batch.get("gate_json")
+        return GatePlan.from_dict(loads(stored)) if stored else None
+
+    def gate_report(self, batch_id: int) -> dict[str, Any]:
+        """Current openings, used risk shares, and per-path conclusions.
+
+        The report is derived deterministically from the persisted results
+        and the fixed plan: pausing, resuming, or adding compute budget
+        replays to exactly the same openings and never adds error risk.
+        """
+        plan = self.gate_plan(batch_id)
+        if plan is None:
+            raise KeyError(f"batch {batch_id} has no gate plan")
+        p_values: dict[int, float | None] = {}
+        hypotheses: dict[int, str] = {}
+        for node in plan.nodes:
+            row = self.store.find_one("tests", id=node.test_id)
+            hypotheses[node.test_id] = row["null_hypothesis"]
+            completed = self.store.find_one("test_results", test_id=node.test_id)
+            p_values[node.test_id] = (
+                float(loads(completed["result_json"])["p_value"])
+                if completed is not None
+                else None
+            )
+        states = plan.evaluate(p_values)
+        entries = []
+        for test_id in sorted(states):
+            state = states[test_id]
+            entries.append(
+                {
+                    "null_hypothesis": hypotheses[test_id],
+                    **state,
+                    "meaning": self._gate_meaning(state),
+                }
+            )
+        rejected = [entry for entry in entries if entry["formal_reject"]]
+        return {
+            "batch_id": batch_id,
+            "alpha": plan.alpha,
+            "plan": plan.to_dict(),
+            "tests": entries,
+            "family": {
+                "family_wise_alpha": plan.alpha,
+                "initial_allocated_share": sum(
+                    node.share for node in plan.nodes
+                ),
+                "max_open_risk_share_over_paths": plan.max_open_risk_share(),
+                "risk_share_used": sum(
+                    entry["risk_share_used"] for entry in entries
+                ),
+                "formally_rejected_test_ids": [
+                    entry["test_id"] for entry in rejected
+                ],
+                "unopened_test_ids": [
+                    entry["test_id"] for entry in entries if not entry["open"]
+                ],
+                "meaning": (
+                    "Formal rejections are only possible for open hypotheses at "
+                    "their pre-allocated share of the family-wise alpha; unopened "
+                    "follow-ups are exploratory only and consume no risk budget. "
+                    "Reopening or extending the run cannot reopen a follow-up "
+                    "whose primary failed, and extra compute budget does not add "
+                    "error risk."
+                ),
+            },
+            "paths": plan.compare_paths(),
+        }
+
+    @staticmethod
+    def _gate_meaning(state: dict[str, Any]) -> str:
+        status = state["status"]
+        if status == "unopened":
+            return (
+                "Follow-up not open: its primary hypotheses were not all "
+                "formally rejected, so any observed value is exploratory only "
+                "and cannot be claimed as a formal pass."
+            )
+        if status == "open-pending":
+            return (
+                "Open for formal judgement but the test has not completed; "
+                "no conclusion yet."
+            )
+        if status == "rejected":
+            return (
+                "Formally rejected at its allocated share of the family-wise "
+                "alpha (risk_share_used records the consumed budget)."
+            )
+        return (
+            "Formally judged and not rejected at its allocated share of the "
+            "family-wise alpha."
+        )
+
 
     def add_test(
         self,
@@ -478,6 +614,18 @@ class PlatformRunner:
         )
         if not rows:
             raise KeyError(f"unknown batch {batch_id}")
+        plan = self.gate_plan(batch_id)
+        gate_states = None
+        if plan is not None:
+            gate_p_values: dict[int, float | None] = {}
+            for node in plan.nodes:
+                completed = self.store.find_one("test_results", test_id=node.test_id)
+                gate_p_values[node.test_id] = (
+                    float(loads(completed["result_json"])["p_value"])
+                    if completed is not None
+                    else None
+                )
+            gate_states = plan.evaluate(gate_p_values)
         results = [self.get_result(int(row["id"])) for row in rows]
         p_values = [item.result.p_value for item in results]
         adjusted = adjust(p_values, rule)
@@ -496,10 +644,24 @@ class PlatformRunner:
                     min(1.0, max(0.0, result.p_value - half)),
                     min(1.0, max(0.0, result.p_value + half)),
                 ]
+            entry_gate = None
+            if gate_states is not None and item.test_id in gate_states:
+                state = gate_states[item.test_id]
+                entry_gate = {
+                    "role": state["role"],
+                    "status": state["status"],
+                    "open": state["open"],
+                    "available_share": state["available_share"],
+                    "alpha_threshold": state["alpha_threshold"],
+                    "risk_share_used": state["risk_share_used"],
+                    "formal_reject": state["formal_reject"],
+                    "exploratory": state["exploratory"],
+                }
             entries.append(
                 {
                     "test_id": item.test_id,
                     "null_hypothesis": item.null_hypothesis,
+                    "gate": entry_gate,
                     "method": result.method,
                     "adaptive": result.adaptive,
                     "looks": result.looks,
