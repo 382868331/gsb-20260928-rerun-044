@@ -38,6 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--samples", type=int, default=10_000)
     run.add_argument("--max-exact-assignments", type=int, default=100_000)
     run.add_argument("--seed", type=int)
+    run.add_argument(
+        "--hypothesis-plan",
+        type=Path,
+        default=None,
+        help="JSON list/dict with pre-planned hierarchy, gates, risk shares, and allocations",
+    )
+    run.add_argument("--family-alpha", type=float, default=0.05)
     run.add_argument("--checkpoint-every", type=int, default=None)
     run.add_argument(
         "--stopping",
@@ -139,6 +146,43 @@ def build_stopping(args: argparse.Namespace) -> dict[str, Any]:
     return stopping
 
 
+def build_specs(args: argparse.Namespace) -> list[TestSpec]:
+    if args.hypothesis_plan is None:
+        settings: dict[str, Any] = {"alternative": args.alternative}
+        if args.conditions:
+            settings["conditions"] = tuple(args.conditions)
+        settings["stopping"] = build_stopping(args)
+        return [
+            TestSpec(
+                test_type=GroupedPermutationTest.test_type,
+                null_hypothesis="Exchangeable condition labels within groups; mean(condition 0) = mean(condition 1).",
+                settings=settings,
+            )
+        ]
+    with args.hypothesis_plan.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    hypotheses = payload.get("hypotheses", payload) if isinstance(payload, dict) else payload
+    specs = []
+    for item in hypotheses:
+        settings = dict(item.get("settings") or {})
+        settings.setdefault("alternative", args.alternative)
+        settings.setdefault("conditions", tuple(args.conditions)) if args.conditions else None
+        hierarchy = item.get("hierarchy")
+        if hierarchy:
+            settings["hierarchy"] = hierarchy
+        specs.append(
+            TestSpec(
+                test_type=GroupedPermutationTest.test_type,
+                null_hypothesis=item.get(
+                    "null_hypothesis",
+                    "Exchangeable condition labels within groups; equal means.",
+                ),
+                settings=settings,
+            )
+        )
+    return specs
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     with PlatformRunner(args.database) as runner:
@@ -152,22 +196,14 @@ def main(argv: list[str] | None = None) -> None:
                 condition_column=args.condition_column,
                 value_column=args.value_column,
             )
-            settings: dict[str, Any] = {"alternative": args.alternative}
-            if args.conditions:
-                settings["conditions"] = tuple(args.conditions)
-            settings["stopping"] = build_stopping(args)
-            spec = TestSpec(
-                test_type=GroupedPermutationTest.test_type,
-                null_hypothesis="Exchangeable condition labels within groups; mean(condition 0) = mean(condition 1).",
-                settings=settings,
-            )
             batch_id = runner.create_batch(
                 dataset,
                 name=args.batch_name,
-                specs=[spec],
+                specs=build_specs(args),
                 samples=args.samples,
                 max_exact_assignments=args.max_exact_assignments,
                 seed=args.seed,
+                family_alpha=args.family_alpha,
             )
             try:
                 results = runner.run_batch(

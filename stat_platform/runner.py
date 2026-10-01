@@ -5,10 +5,18 @@ import json
 import math
 import random
 from pathlib import Path
+from dataclasses import replace
 from statistics import NormalDist
 from typing import Any, Sequence
 
 from .adjustment import adjust
+from .hierarchy import (
+    HypothesisGate,
+    gates_for_specs,
+    gate_is_opened_by,
+    path_risk_summaries,
+    validate_gates,
+)
 from .models import Dataset, PermutationResult, TestResult, TestSpec
 from .permutation import AssignmentRecord, GroupedPermutationTest
 from .sequential import SequentialDesign, build_design, default_looks
@@ -43,6 +51,7 @@ class PlatformRunner:
         samples: int = 10_000,
         max_exact_assignments: int = 100_000,
         seed: int | None = None,
+        family_alpha: float = 0.05,
     ) -> int:
         dataset_id = self._store_dataset(dataset)
         batch_id = self.store.insert(
@@ -51,19 +60,24 @@ class PlatformRunner:
                 "dataset_id": dataset_id,
                 "name": name or f"{dataset.name}:{dataset.version}",
                 "seed": seed,
+                "family_alpha": family_alpha,
             },
         )
         self.store.insert(
             "batch_states",
             {"batch_id": batch_id, "rng_state_json": None, "random_draws": 0},
         )
-        for spec in specs or ():
+        spec_list = tuple(specs or ())
+        gates = gates_for_specs(spec_list)
+        validate_gates(gates, family_alpha)
+        for index, spec in enumerate(spec_list):
             self.add_test(
                 batch_id,
                 spec,
                 samples=samples,
                 max_exact_assignments=max_exact_assignments,
                 seed=seed,
+                gate=gates[index],
             )
         self.store.commit()
         return batch_id
@@ -76,6 +90,7 @@ class PlatformRunner:
         samples: int = 10_000,
         max_exact_assignments: int = 100_000,
         seed: int | None = None,
+        gate: HypothesisGate | None = None,
     ) -> int:
         test_id = self.store.insert(
             "tests",
@@ -87,8 +102,12 @@ class PlatformRunner:
                 "seed": seed,
                 "samples": samples,
                 "max_exact_assignments": max_exact_assignments,
+                "hypothesis_key": gate.key if gate is not None else None,
+                "parent_hypothesis": gate.parent if gate is not None else None,
+                "risk_share": gate.risk_share if gate is not None else None,
             },
         )
+        initial_status = "open" if gate is None or gate.parent is None else "pending"
         self.store.insert(
             "run_states",
             {
@@ -97,6 +116,11 @@ class PlatformRunner:
                 "as_extreme_count": 0,
                 "random_draws": 0,
                 "rng_state_json": None,
+                "gate_status": initial_status,
+                "gate_opened_at": 0,
+                "formal_evaluated_start": 0,
+                "exploratory_evaluated": 0,
+                "exploratory_hits": 0,
             },
         )
         self.store.commit()
@@ -109,10 +133,33 @@ class PlatformRunner:
         max_new_samples: int | None = None,
     ) -> list[TestResult]:
         rows = sorted(self.store.find_many("tests", batch_id=batch_id), key=lambda row: int(row["id"]))
-        return [
-            self.run_test(int(row["id"]), max_new_samples=max_new_samples)
-            for row in rows
-        ]
+        results = []
+        completed = set()
+        while len(completed) < len(rows):
+            progressed = False
+            for row in rows:
+                test_id = int(row["id"])
+                if test_id in completed:
+                    continue
+                state = self.store.find_one("run_states", test_id=test_id)
+                status = state.get("gate_status", "open")
+                if status == "pending":
+                    if self._open_dependent(test_id):
+                        progressed = True
+                    else:
+                        completed.add(test_id)
+                    continue
+                if status == "closed":
+                    completed.add(test_id)
+                    continue
+                result = self.run_test(test_id, max_new_samples=max_new_samples)
+                results.append(result)
+                completed.add(test_id)
+                progressed = True
+                self._update_dependent_gates(batch_id)
+            if not progressed:
+                break
+        return results
 
     def run_test(
         self,
@@ -148,6 +195,11 @@ class PlatformRunner:
         test = self.store.find_one("tests", id=test_id)
         if test is None:
             raise KeyError(f"unknown test {test_id}")
+        state = self.store.find_one("run_states", test_id=test_id)
+        if state.get("gate_status") == "pending":
+            raise RuntimeError("this hypothesis is not open; its information is exploratory only")
+        if state.get("gate_status") == "closed":
+            raise RuntimeError("this hypothesis remained unopened because its gate was not met")
         batch = self.store.find_one("batches", id=int(test["batch_id"]))
         dataset_row = self.store.find_one("datasets", id=int(batch["dataset_id"]))
         dataset = self._dataset_from_row(dataset_row)
@@ -158,7 +210,6 @@ class PlatformRunner:
             self.store.find_many("permutation_samples", test_id=test_id),
             key=lambda row: int(row["ordinal"]),
         )
-        state = self.store.find_one("run_states", test_id=test_id)
         if engine.total_assignments > int(test["max_exact_assignments"]):
             return self._advance_monte_carlo(
                 test, engine, spec, state, max_new_samples
@@ -199,6 +250,8 @@ class PlatformRunner:
         self.store.commit()
         if not run.complete:
             return None
+        if run.result is not None:
+            run = replace(run, result=self._with_gate_info(test, state, run.result))
         self.store.insert(
             "test_results",
             {"test_id": test_id, "result_json": dumps(run.result.to_dict())},
@@ -218,6 +271,10 @@ class PlatformRunner:
         batch_id = int(test["batch_id"])
         stopping = engine.stopping_settings()
         rule = stopping.get("type", "fixed")
+        risk_share = test.get("risk_share")
+        if risk_share is not None and rule == "decision":
+            stopping = dict(stopping)
+            stopping.setdefault("risk_significant", float(risk_share))
         adaptive = rule != "fixed"
         design = self._load_design(state, stopping, engine.total_assignments)
         look_schedule = design.looks if design is not None else None
@@ -332,6 +389,7 @@ class PlatformRunner:
             design=design.to_dict() if design is not None else None,
             look_log=tuple(look_log),
         )
+        result = self._with_gate_info(test, state, result)
         self.store.insert(
             "test_results",
             {"test_id": test_id, "result_json": dumps(result.to_dict())},
@@ -411,6 +469,37 @@ class PlatformRunner:
             "looks_recorded": int(state.get("looks", 0)),
             "look_log": list(loads(state.get("look_log_json") or "[]")),
         }
+        if test.get("hypothesis_key") is not None:
+            entry.update(
+                {
+                    "hypothesis": test.get("hypothesis_key"),
+                    "parent": test.get("parent_hypothesis"),
+                    "gate_status": state.get("gate_status", "open"),
+                    "formal_status": (
+                        "exploratory-only" if state.get("gate_status") != "open" else "formal"
+                    ),
+                    "risk_share": test.get("risk_share"),
+                }
+            )
+            if state.get("gate_status") == "pending":
+                batch = self.store.find_one("batches", id=int(test["batch_id"]))
+                dataset = self._dataset_from_row(
+                    self.store.find_one("datasets", id=int(batch["dataset_id"]))
+                )
+                engine = self._engine(
+                    dataset,
+                    TestSpec(test["test_type"], test["null_hypothesis"], settings),
+                )
+                preview_limit = min(int(test["samples"]), engine.total_assignments)
+                pool = self._ensure_pool(int(test["batch_id"]), engine, preview_limit)
+                preview_hits = sum(engine.evaluate(assignment).as_extreme for assignment in pool)
+                entry["exploratory_preview"] = {
+                    "evaluated": len(pool),
+                    "as_extreme_count": preview_hits,
+                    "p_estimate": (preview_hits + 1) / (len(pool) + 1),
+                    "persisted_to_test": False,
+                    "formal_status": "exploratory-only",
+                }
         if design is not None:
             entry["design"] = design.to_dict()
             entry["next_conditions"] = design.progress(evaluated, hits)
@@ -465,6 +554,73 @@ class PlatformRunner:
             self.store.commit()
         return [tuple(json.loads(row["assignment_key"])) for row in rows[:needed]]
 
+    def _with_gate_info(
+        self,
+        test: dict[str, Any],
+        state: dict[str, Any],
+        result: PermutationResult,
+    ) -> PermutationResult:
+        if test.get("hypothesis_key") is None:
+            return result
+        return replace(
+            result,
+            gate_info={
+                "hypothesis": test["hypothesis_key"],
+                "parent": test.get("parent_hypothesis"),
+                "status": state.get("gate_status", "open"),
+                "opened_after_assignment": state.get("gate_opened_at", 0),
+                "risk_share": test.get("risk_share"),
+                "formal_status": "formal" if state.get("gate_status", "open") == "open" else "exploratory",
+            },
+        )
+
+    def _open_dependent(self, test_id: int) -> bool:
+        self._update_dependent_gates(
+            int(self.store.find_one("tests", id=test_id)["batch_id"])
+        )
+        state = self.store.find_one("run_states", test_id=test_id)
+        return state.get("gate_status") == "open"
+
+    def _update_dependent_gates(self, batch_id: int) -> None:
+        tests = {
+            row["hypothesis_key"]: row
+            for row in self.store.find_many("tests", batch_id=batch_id)
+            if row.get("hypothesis_key") is not None
+        }
+        changed = False
+        for test in tests.values():
+            parent_key = test.get("parent_hypothesis")
+            if parent_key is None:
+                continue
+            state = self.store.find_one("run_states", test_id=int(test["id"]))
+            if state.get("gate_status") != "pending":
+                continue
+            parent = tests[parent_key]
+            completed = self.store.find_one("test_results", test_id=int(parent["id"]))
+            if completed is None:
+                continue
+            parent_result = self._result_from_dict(loads(completed["result_json"]))
+            settings = loads(test["settings_json"])
+            gate = HypothesisGate.from_settings(settings, int(test["id"]) - 1)
+            opened = gate_is_opened_by(
+                gate,
+                parent_result,
+                p_value=parent_result.p_value,
+            )
+            state.update(
+                {
+                    "gate_status": "open" if opened else "closed",
+                    "gate_opened_at": int(
+                        self.store.find_one("run_states", test_id=int(parent["id"]))[
+                            "evaluated_assignments"
+                        ]
+                    ) if opened else 0,
+                }
+            )
+            changed = True
+        if changed:
+            self.store.commit()
+
     def compare_batch(
         self,
         batch_id: int,
@@ -478,27 +634,86 @@ class PlatformRunner:
         )
         if not rows:
             raise KeyError(f"unknown batch {batch_id}")
-        results = [self.get_result(int(row["id"])) for row in rows]
-        p_values = [item.result.p_value for item in results]
-        adjusted = adjust(p_values, rule)
-        m = len(results)
+        batch_row = self.store.find_one("batches", id=batch_id)
+        all_items = []
+        for row in rows:
+            test_id = int(row["id"])
+            completed_row = self.store.find_one("test_results", test_id=test_id)
+            if completed_row is not None:
+                item = self.get_result(test_id)
+                all_items.append((row, item, item.result.p_value))
+            else:
+                all_items.append((row, None, None))
+        formal_items = [item for item in all_items if item[1] is not None]
+        regular_items = [
+            item
+            for item in formal_items
+            if item[0].get("hypothesis_key") is None
+        ]
+        adjusted = adjust([p_value for _, _, p_value in regular_items], rule)
+        m = len(regular_items)
         entries = []
-        for item, p_adj in zip(results, adjusted):
+        adjusted_by_id = {
+            item.test_id: p_adj
+            for (_, item, _), p_adj in zip(regular_items, adjusted)
+        }
+        for row, item, _ in all_items:
+            state = self.store.find_one("run_states", test_id=int(row["id"]))
+            gate_status = state.get("gate_status", "open")
+            if item is None:
+                entries.append(
+                    {
+                        "test_id": int(row["id"]),
+                        "null_hypothesis": row["null_hypothesis"],
+                        "hypothesis": row.get("hypothesis_key"),
+                        "parent": row.get("parent_hypothesis"),
+                        "gate_status": gate_status,
+                        "formal_status": "not-open",
+                        "risk_share": row.get("risk_share"),
+                        "adjusted_reject": False,
+                        "formal_conclusion": None,
+                        "exploratory_evidence": None,
+                        "individual_meaning": (
+                            "The gate did not open; an unopened observation is not a formal conclusion."
+                            if gate_status == "closed"
+                            else "The gate is pending; current information is exploratory only."
+                        ),
+                    }
+                )
+                continue
             result = item.result
+            p_adj = adjusted_by_id.get(item.test_id, result.p_value)
+            is_hierarchical = row.get("hypothesis_key") is not None
+            allocated_share = row.get("risk_share")
+            adjusted_reject = (
+                result.p_value <= float(allocated_share)
+                if is_hierarchical and allocated_share is not None
+                else p_adj <= alpha
+            )
+            reported_adjusted_p = result.p_value if is_hierarchical else p_adj
             adjusted_interval = None
             adjusted_level = None
             if result.standard_error is not None:
                 base_level = result.confidence_level or 0.95
-                adjusted_level = 1.0 - (1.0 - base_level) / m
+                adjusted_level = 1.0 - (1.0 - base_level) / max(1, m)
                 z_adj = NormalDist().inv_cdf((1.0 + adjusted_level) / 2.0)
                 half = z_adj * result.standard_error
                 adjusted_interval = [
                     min(1.0, max(0.0, result.p_value - half)),
                     min(1.0, max(0.0, result.p_value + half)),
                 ]
+            if is_hierarchical:
+                adjusted_interval = None
+                adjusted_level = None
             entries.append(
                 {
                     "test_id": item.test_id,
+                    "hypothesis": row.get("hypothesis_key"),
+                    "parent": row.get("parent_hypothesis"),
+                    "gate_status": gate_status,
+                    "formal_status": "formal",
+                    "risk_share": row.get("risk_share"),
+                    "allocated_risk_share": allocated_share,
                     "null_hypothesis": item.null_hypothesis,
                     "method": result.method,
                     "adaptive": result.adaptive,
@@ -507,8 +722,13 @@ class PlatformRunner:
                     "stopped_reason": result.stopped_reason,
                     "unadjusted_p_value": result.p_value,
                     "unadjusted_reject": result.p_value <= alpha,
-                    "adjusted_p_value": p_adj,
-                    "adjusted_reject": p_adj <= alpha,
+                    "adjusted_p_value": reported_adjusted_p,
+                    "adjusted_reject": adjusted_reject,
+                    "adjustment_basis": (
+                        "preallocated hierarchical risk share"
+                        if is_hierarchical
+                        else rule
+                    ),
                     "confidence_level": result.confidence_level,
                     "confidence_interval": list(result.confidence_interval)
                     if result.confidence_interval is not None
@@ -520,24 +740,54 @@ class PlatformRunner:
                 }
             )
         family_rejected = [entry for entry in entries if entry["adjusted_reject"]]
-        decided = [entry for entry in entries if entry["individual_decision"] is not None]
+        decided = [entry for entry in entries if entry.get("individual_decision") is not None]
+        gate_records = []
+        outcomes = {}
+        for row, item, _ in all_items:
+            key = row.get("hypothesis_key")
+            if key is None:
+                continue
+            state = self.store.find_one("run_states", test_id=int(row["id"]))
+            status = state.get("gate_status", "open")
+            gate_records.append(
+                (
+                    int(row["id"]),
+                    HypothesisGate.from_settings(
+                        loads(row["settings_json"]), int(row["id"]) - 1
+                    ),
+                )
+            )
+            outcomes[key] = {"status": status, "result": item.result if item is not None else None}
+        family_alpha = float(batch_row.get("family_alpha", alpha))
+        gate_paths = path_risk_summaries(gate_records, outcomes, family_alpha)
         family = {
-            "number_of_tests": m,
+            "number_of_tests": len(rows),
+            "regular_test_count": m,
+            "planned_family_alpha": family_alpha,
             "rule": rule,
             "family_wise_alpha": alpha,
+            "formally_open_count": m,
+            "pending_test_ids": [
+                e["test_id"]
+                for e in entries
+                if e.get("gate_status") == "pending"
+            ],
+            "closed_test_ids": [e["test_id"] for e in entries if e.get("gate_status") == "closed"],
+            "gate_paths": gate_paths,
             "family_rejected_count": len(family_rejected),
             "family_rejected_test_ids": [entry["test_id"] for entry in family_rejected],
-            "all_individual_decisions_made": len(decided) == m,
+            "all_individual_decisions_made": len(decided) == len(formal_items),
             "undecided_test_ids": [
                 entry["test_id"]
                 for entry in entries
-                if entry["individual_decision"] is None and entry["adaptive"]
+                if entry.get("individual_decision") is None and entry.get("adaptive")
             ],
             "meaning": (
                 "Per-test entries judge each null hypothesis separately at its own "
                 "pre-planned decision risk; adjusted_reject additionally controls the "
-                f"family-wise error over all {m} tests under shared (possibly dependent) "
-                "permutations using the " + rule + " rule. A family claim that at least "
+                f"family-wise error over the {m} regular tests under shared (possibly "
+                "dependent) permutations using the " + rule + " rule. Hierarchical tests "
+                "use their preallocated risk shares. A family claim that at least "
                 "one null is false requires an adjusted rejection; it does not imply the "
                 "other hypotheses are false."
             ),

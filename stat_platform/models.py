@@ -65,6 +65,7 @@ class PermutationResult:
     decision: str | None = None
     design: dict[str, Any] | None = None
     look_log: tuple[dict[str, Any], ...] = ()
+    gate_info: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -88,6 +89,7 @@ class PermutationResult:
             "decision": self.decision,
             "design": self.design,
             "look_log": list(self.look_log),
+            "gate_info": self.gate_info,
         }
         return result
 

@@ -18,6 +18,37 @@
 
 ## 多重比较
 
+### 主要假设与后续假设门控
+
+多项假设可以在运行前放进一个层级计划：每项声明 `hierarchy.key`、`risk_share`，后续项再声明 `parent`、开放条件（如 `p_value_at_most`）和 `allocation`。`PlatformRunner.create_batch(..., family_alpha=...)` 会先检查每条根到叶路径的风险份额总和，不合法则整组拒绝运行。
+
+后续假设在父假设正式满足条件前保持 `pending`，`peek` 只显示探索状态，直接运行未开放假设会报错；父假设失败时依赖项变为不可变的 `closed`，暂停恢复或重开试验都不能绕过该条件。已经开放的假设才保存并正式判断自己的证据，未开放阶段的观察不会计入调整结论。
+
+`compare` 的 `family.gate_paths` 对每条开放路径列出：运行前 `preplanned_allocation`、`planned_risk_share`、已经由正式拒绝使用的 `used_risk_share`、剩余份额以及最终可作出的正式结论。追加计算预算只延长证据收集，不会改变预先固定的门控、分配或错误风险。
+
+Python 示例：
+
+```python
+primary = TestSpec(..., settings={
+    "alternative": "less",
+    "hierarchy": {"key": "P1", "risk_share": 0.03,
+                   "allocation": {"formal_samples": 10000}},
+})
+follow_up = TestSpec(..., settings={
+    "alternative": "two-sided",
+    "hierarchy": {
+        "key": "F1", "parent": "P1", "risk_share": 0.02,
+        "open_when": {"p_value_at_most": 0.05},
+        "allocation": {"formal_samples_after_open": 5000},
+    },
+})
+with PlatformRunner("experiments.json") as platform:
+    batch_id = platform.create_batch(dataset, specs=[primary, follow_up],
+                                    family_alpha=0.05)
+```
+
+命令行可用 `--hypothesis-plan plan.json --family-alpha 0.05` 提交同一组预声明计划。
+
 对同一批次内的全部已完成检验给出未经调整与调整后的结论，并保留不确定范围：
 
 ```bash
