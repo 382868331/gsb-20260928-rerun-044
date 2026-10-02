@@ -20,7 +20,11 @@
 
 ### 主要假设与后续假设门控
 
-多项假设可以在运行前放进一个层级计划：每项声明 `hierarchy.key`、`risk_share`，后续项再声明 `parent`、开放条件（如 `p_value_at_most`）和 `allocation`。`PlatformRunner.create_batch(..., family_alpha=...)` 会先检查每条根到叶路径的风险份额总和，不合法则整组拒绝运行。
+多项假设可以在运行前放进一个层级计划：每项声明 `hierarchy.key`、`risk_share`，后续项再声明 `parent`（或 `parents` 列表）、开放条件（如 `p_value_at_most`）和 `allocation`。`PlatformRunner.create_batch(..., family_alpha=...)` 会先检查每条根到叶路径的风险份额总和，**并且检查同一确认家族全部声明份额的合计不超过 `family_alpha`**——两条并列主要假设各占 0.04、整组预算只有 0.05 的计划会被整组拒绝，错误信息列出冲突的各项分配；不合法计划不会创建任何检验，原批次记录与已有探索结果保留不动。
+
+多个主要假设可以共同打开同一个后续假设：用 `parents` 列出全部父假设，并必须预先声明 `parent_mode`（`"any"` 任一父假设满足即开放，或 `"all"` 必须全部满足），以及 `share_on_close` 指定失败或关闭后未用份额的去向（`"reserved"` 默认锁定、`"family"` 归还整组、或另一个假设的 key 转移给它）。同一后续项只领取一份符合原规则的可用额度，多条路径先后打开不会重复领用；开放者记录在 `gate_opened_by`。已经用于正式判断的份额不会因为撤回查看、重开试验或重复运行已完成检验而再次可用。
+
+`compare` 的 `family.budget_ledger` 逐项列出：`initial_share`（初始分配）、`transferred_in`/`transferred_out`（转移）、`used_share`（已用于正式判断）、`remaining_share`（剩余）与 `effective_share`（初始加转移入，层级假设的正式判断按它进行）；家族层面汇总 `total_used_share`、`returned_to_family`、`reserved_share` 与 `family_remaining_share`。
 
 后续假设在父假设正式满足条件前保持 `pending`，`peek` 只显示探索状态，直接运行未开放假设会报错；父假设失败时依赖项变为不可变的 `closed`，暂停恢复或重开试验都不能绕过该条件。已经开放的假设才保存并正式判断自己的证据，未开放阶段的观察不会计入调整结论。
 

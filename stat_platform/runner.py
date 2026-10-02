@@ -12,6 +12,7 @@ from typing import Any, Sequence
 from .adjustment import adjust
 from .hierarchy import (
     HypothesisGate,
+    budget_ledger,
     gates_for_specs,
     gate_is_opened_by,
     path_risk_summaries,
@@ -104,6 +105,7 @@ class PlatformRunner:
                 "max_exact_assignments": max_exact_assignments,
                 "hypothesis_key": gate.key if gate is not None else None,
                 "parent_hypothesis": gate.parent if gate is not None else None,
+                "parent_hypotheses_json": dumps(list(gate.parents)) if gate is not None else None,
                 "risk_share": gate.risk_share if gate is not None else None,
             },
         )
@@ -118,6 +120,7 @@ class PlatformRunner:
                 "rng_state_json": None,
                 "gate_status": initial_status,
                 "gate_opened_at": 0,
+                "gate_opened_by": None,
                 "formal_evaluated_start": 0,
                 "exploratory_evaluated": 0,
                 "exploratory_hits": 0,
@@ -589,32 +592,60 @@ class PlatformRunner:
         }
         changed = False
         for test in tests.values():
-            parent_key = test.get("parent_hypothesis")
-            if parent_key is None:
-                continue
             state = self.store.find_one("run_states", test_id=int(test["id"]))
             if state.get("gate_status") != "pending":
                 continue
-            parent = tests[parent_key]
-            completed = self.store.find_one("test_results", test_id=int(parent["id"]))
-            if completed is None:
-                continue
-            parent_result = self._result_from_dict(loads(completed["result_json"]))
             settings = loads(test["settings_json"])
             gate = HypothesisGate.from_settings(settings, int(test["id"]) - 1)
-            opened = gate_is_opened_by(
-                gate,
-                parent_result,
-                p_value=parent_result.p_value,
-            )
+            if gate is None or not gate.parents:
+                continue
+            parent_rows = [tests[parent] for parent in gate.parents]
+            evaluations = []
+            for parent_row in parent_rows:
+                completed = self.store.find_one(
+                    "test_results", test_id=int(parent_row["id"])
+                )
+                if completed is None:
+                    evaluations.append(None)
+                    continue
+                parent_result = self._result_from_dict(loads(completed["result_json"]))
+                evaluations.append(
+                    gate_is_opened_by(gate, parent_result, p_value=parent_result.p_value)
+                )
+            mode = gate.parent_mode or "any"
+            opener = None
+            close = False
+            if mode == "all":
+                if any(evaluation is False for evaluation in evaluations):
+                    close = True
+                elif all(evaluation is True for evaluation in evaluations):
+                    opener = parent_rows[0]
+            else:
+                for parent_row, evaluation in zip(parent_rows, evaluations):
+                    if evaluation is True:
+                        opener = parent_row
+                        break
+                if opener is None and all(
+                    evaluation is False for evaluation in evaluations
+                ):
+                    close = True
+            if opener is None and not close:
+                continue
             state.update(
                 {
-                    "gate_status": "open" if opened else "closed",
-                    "gate_opened_at": int(
-                        self.store.find_one("run_states", test_id=int(parent["id"]))[
-                            "evaluated_assignments"
-                        ]
-                    ) if opened else 0,
+                    "gate_status": "closed" if close else "open",
+                    "gate_opened_by": (
+                        None if close else opener["hypothesis_key"]
+                    ),
+                    "gate_opened_at": (
+                        0
+                        if close
+                        else int(
+                            self.store.find_one(
+                                "run_states", test_id=int(opener["id"])
+                            )["evaluated_assignments"]
+                        )
+                    ),
                 }
             )
             changed = True
@@ -652,6 +683,31 @@ class PlatformRunner:
         ]
         adjusted = adjust([p_value for _, _, p_value in regular_items], rule)
         m = len(regular_items)
+        gate_records = []
+        outcomes = {}
+        for row, item, _ in all_items:
+            key = row.get("hypothesis_key")
+            if key is None:
+                continue
+            state = self.store.find_one("run_states", test_id=int(row["id"]))
+            gate_records.append(
+                (
+                    int(row["id"]),
+                    HypothesisGate.from_settings(
+                        loads(row["settings_json"]), int(row["id"]) - 1
+                    ),
+                )
+            )
+            outcomes[key] = {
+                "status": state.get("gate_status", "open"),
+                "result": item.result if item is not None else None,
+                "opened_by": state.get("gate_opened_by"),
+            }
+        family_alpha = float(batch_row.get("family_alpha", alpha))
+        ledger = budget_ledger(gate_records, outcomes, family_alpha)
+        ledger_by_key = {
+            entry["hypothesis"]: entry for entry in ledger["hypotheses"]
+        }
         entries = []
         adjusted_by_id = {
             item.test_id: p_adj
@@ -685,9 +741,15 @@ class PlatformRunner:
             p_adj = adjusted_by_id.get(item.test_id, result.p_value)
             is_hierarchical = row.get("hypothesis_key") is not None
             allocated_share = row.get("risk_share")
+            ledger_entry = ledger_by_key.get(row.get("hypothesis_key"))
+            effective_share = (
+                ledger_entry["effective_share"]
+                if is_hierarchical and ledger_entry is not None
+                else allocated_share
+            )
             adjusted_reject = (
-                result.p_value <= float(allocated_share)
-                if is_hierarchical and allocated_share is not None
+                result.p_value <= float(effective_share)
+                if is_hierarchical and effective_share is not None
                 else p_adj <= alpha
             )
             reported_adjusted_p = result.p_value if is_hierarchical else p_adj
@@ -714,6 +776,15 @@ class PlatformRunner:
                     "formal_status": "formal",
                     "risk_share": row.get("risk_share"),
                     "allocated_risk_share": allocated_share,
+                    "transferred_in_share": (
+                        sum(
+                            transfer["amount"]
+                            for transfer in ledger_entry["transferred_in"]
+                        )
+                        if ledger_entry is not None
+                        else None
+                    ),
+                    "effective_risk_share": effective_share if is_hierarchical else None,
                     "null_hypothesis": item.null_hypothesis,
                     "method": result.method,
                     "adaptive": result.adaptive,
@@ -741,24 +812,6 @@ class PlatformRunner:
             )
         family_rejected = [entry for entry in entries if entry["adjusted_reject"]]
         decided = [entry for entry in entries if entry.get("individual_decision") is not None]
-        gate_records = []
-        outcomes = {}
-        for row, item, _ in all_items:
-            key = row.get("hypothesis_key")
-            if key is None:
-                continue
-            state = self.store.find_one("run_states", test_id=int(row["id"]))
-            status = state.get("gate_status", "open")
-            gate_records.append(
-                (
-                    int(row["id"]),
-                    HypothesisGate.from_settings(
-                        loads(row["settings_json"]), int(row["id"]) - 1
-                    ),
-                )
-            )
-            outcomes[key] = {"status": status, "result": item.result if item is not None else None}
-        family_alpha = float(batch_row.get("family_alpha", alpha))
         gate_paths = path_risk_summaries(gate_records, outcomes, family_alpha)
         family = {
             "number_of_tests": len(rows),
@@ -774,6 +827,7 @@ class PlatformRunner:
             ],
             "closed_test_ids": [e["test_id"] for e in entries if e.get("gate_status") == "closed"],
             "gate_paths": gate_paths,
+            "budget_ledger": ledger,
             "family_rejected_count": len(family_rejected),
             "family_rejected_test_ids": [entry["test_id"] for entry in family_rejected],
             "all_individual_decisions_made": len(decided) == len(formal_items),

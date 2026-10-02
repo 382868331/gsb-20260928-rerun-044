@@ -47,7 +47,7 @@ def plan() -> list[TestSpec]:
             "F1a",
             "less",
             parent="P1",
-            share=0.2,
+            share=0.05,
             threshold=0.4,
             allocation={"formal_samples_after_open": 8},
         ),
@@ -55,16 +55,16 @@ def plan() -> list[TestSpec]:
             "F1b",
             "greater",
             parent="P1",
-            share=0.2,
+            share=0.05,
             threshold=0.4,
             allocation={"formal_samples_after_open": 8},
         ),
-        gated_spec("P2", "two-sided", share=0.2, allocation={"formal_samples": 8}),
+        gated_spec("P2", "two-sided", share=0.1, allocation={"formal_samples": 8}),
         gated_spec(
             "F2",
             "two-sided",
             parent="P2",
-            share=0.2,
+            share=0.05,
             threshold=0.4,
             allocation={"formal_samples_after_open": 8},
         ),
@@ -136,7 +136,7 @@ def test_dependent_hypotheses_open_only_after_primary_gate(tmp_path: Path):
         assert report["family"]["closed_test_ids"] == [tests["F2"]["id"]]
         assert report["family"]["planned_family_alpha"] == 0.6
         paths = {tuple(item["path"]): item for item in report["family"]["gate_paths"]}
-        assert paths[("P1", "F1a")]["planned_risk_share"] == pytest.approx(0.55)
+        assert paths[("P1", "F1a")]["planned_risk_share"] == pytest.approx(0.4)
         assert paths[("P1", "F1a")]["used_risk_share"] == pytest.approx(0.35)
         assert paths[("P1", "F1b")]["formal_claims"][-1]["decision"] == "not-significant"
         assert paths[("P2", "F2")]["status"] == "closed"
