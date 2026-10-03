@@ -15,6 +15,7 @@ EMPTY_DATABASE: dict[str, list[dict[str, Any]]] = {
     "batch_states": [],
     "run_states": [],
     "test_results": [],
+    "share_transfers": [],
 }
 
 

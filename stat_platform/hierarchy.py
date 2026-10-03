@@ -11,6 +11,10 @@ class HypothesisGate:
     open_when: dict[str, Any] | None
     risk_share: float | None
     allocation: dict[str, Any] = field(default_factory=dict)
+    parents: tuple[str, ...] = ()
+    parent_mode: str = "all"
+    parent_mode_explicit: bool = False
+    reallocate_to: str | None = None
 
     @classmethod
     def from_settings(cls, settings: dict[str, Any], index: int) -> "HypothesisGate | None":
@@ -18,17 +22,29 @@ class HypothesisGate:
         if not value:
             return None
         key = str(value.get("key") or f"H{index + 1}")
-        parent = value.get("parent")
+        raw_parents = value.get("parents", value.get("parent"))
+        if raw_parents is None:
+            parents: tuple[str, ...] = ()
+        elif isinstance(raw_parents, str):
+            parents = (raw_parents,)
+        else:
+            parents = tuple(str(item) for item in raw_parents)
+        parent = parents[0] if parents else None
         condition = value.get("open_when") or (
             {"decision": "significant"} if parent is not None else None
         )
         risk_share = value.get("risk_share")
+        reallocate_to = value.get("reallocate_to")
         return cls(
             key=key,
-            parent=str(parent) if parent is not None else None,
+            parent=parent,
             open_when=dict(condition) if condition is not None else None,
             risk_share=float(risk_share) if risk_share is not None else None,
             allocation=dict(value.get("allocation") or {}),
+            parents=parents,
+            parent_mode=str(value.get("parent_mode") or "all"),
+            parent_mode_explicit="parent_mode" in value,
+            reallocate_to=str(reallocate_to) if reallocate_to is not None else None,
         )
 
 
@@ -48,28 +64,69 @@ def validate_gates(gates: Sequence[HypothesisGate | None], family_alpha: float =
     for gate in declared:
         if gate.risk_share is None or not 0.0 < gate.risk_share <= family_alpha + 1e-12:
             raise ValueError("risk_share must lie in (0, family_alpha]")
-        if gate.parent is not None:
-            if gate.parent not in key_set:
-                raise ValueError(f"unknown parent hypothesis {gate.parent}")
+        if gate.parents:
+            for parent in gate.parents:
+                if parent not in key_set:
+                    raise ValueError(f"unknown parent hypothesis {parent}")
             if gate.open_when is None:
                 raise ValueError("a dependent hypothesis needs open_when")
+            if len(gate.parents) > 1 and not gate.parent_mode_explicit:
+                raise ValueError(
+                    "a hypothesis with multiple parents must predeclare parent_mode "
+                    "('all' parents must satisfy the gate, or 'any' single one)"
+                )
+            if gate.parent_mode not in {"all", "any"}:
+                raise ValueError("parent_mode must be 'all' or 'any'")
+        if gate.reallocate_to is not None:
+            if gate.reallocate_to not in key_set:
+                raise ValueError(f"unknown reallocation target {gate.reallocate_to}")
+            if gate.reallocate_to == gate.key:
+                raise ValueError("a hypothesis cannot reallocate its share to itself")
 
     by_key = {gate.key: gate for gate in declared}
-    for gate in declared:
-        path: list[str] = []
-        current = gate
-        while current.parent is not None:
-            if current.key in path:
-                raise ValueError("hypothesis gates must not contain cycles")
-            path.append(current.key)
-            current = by_key[current.parent]
-        shares = [
-            node.risk_share
-            for node in [by_key[key] for key in reversed(path)] + [gate]
-            if node.risk_share is not None
-        ]
+    for path in enumerate_root_paths(declared):
+        shares = [by_key[key].risk_share or 0.0 for key in path]
         if sum(shares) > family_alpha + 1e-12:
-            raise ValueError("risk shares on every root-to-leaf path must not exceed family alpha")
+            raise ValueError(
+                "risk shares on every root-to-leaf path must not exceed family alpha"
+            )
+
+    roots = [gate for gate in declared if not gate.parents]
+    root_total = sum(gate.risk_share or 0.0 for gate in roots)
+    if root_total > family_alpha + 1e-12:
+        detail = ", ".join(
+            f"{gate.key}={gate.risk_share:g}" for gate in roots
+        )
+        raise ValueError(
+            "risk shares of parallel primary hypotheses exceed the family budget: "
+            f"{detail} sum to {root_total:g} > family alpha {family_alpha:g}"
+        )
+
+
+def enumerate_root_paths(declared: Sequence[HypothesisGate]) -> list[list[str]]:
+    """Every root-to-leaf path of the (possibly multi-parent) gate graph."""
+    by_key = {gate.key: gate for gate in declared}
+    memo: dict[str, list[list[str]]] = {}
+
+    def paths_to(key: str, active: frozenset[str]) -> list[list[str]]:
+        if key in active:
+            raise ValueError("hypothesis gates must not contain cycles")
+        if key in memo:
+            return memo[key]
+        gate = by_key[key]
+        if not gate.parents:
+            paths = [[key]]
+        else:
+            paths = []
+            for parent in gate.parents:
+                for prefix in paths_to(parent, active | {key}):
+                    paths.append(prefix + [key])
+        memo[key] = paths
+        return paths
+
+    children = {parent for gate in declared for parent in gate.parents}
+    leaves = [gate.key for gate in declared if gate.key not in children]
+    return [path for leaf in leaves for path in paths_to(leaf, frozenset())]
 
 
 def gate_is_opened_by(
@@ -90,19 +147,11 @@ def path_risk_summaries(
     family_alpha: float,
 ) -> list[dict[str, Any]]:
     by_key = {gate.key: (test_id, gate) for test_id, gate in gates}
-    leaves = [
-        gate
-        for _, gate in gates
-        if gate.key not in {node.parent for _, node in gates if node.parent is not None}
-    ]
+    declared = [gate for _, gate in gates]
     summaries = []
-    for leaf in leaves:
-        chain: list[HypothesisGate] = []
-        current: HypothesisGate | None = leaf
-        while current is not None:
-            chain.append(current)
-            current = by_key[current.parent][1] if current.parent is not None else None
-        chain.reverse()
+    for path in enumerate_root_paths(declared):
+        chain = [by_key[key][1] for key in path]
+        leaf = chain[-1]
         planned_share = sum(node.risk_share or 0.0 for node in chain)
         used_share = 0.0
         status = "pending"

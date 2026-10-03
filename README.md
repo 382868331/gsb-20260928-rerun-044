@@ -22,9 +22,17 @@
 
 多项假设可以在运行前放进一个层级计划：每项声明 `hierarchy.key`、`risk_share`，后续项再声明 `parent`、开放条件（如 `p_value_at_most`）和 `allocation`。`PlatformRunner.create_batch(..., family_alpha=...)` 会先检查每条根到叶路径的风险份额总和，不合法则整组拒绝运行。
 
+同一个确认家族里，全部并列主要假设（没有 `parent` 的项）的 `risk_share` 之和也不能超过 `family_alpha`：不能只因每条根到叶路径单独看不超额，就接受合计超出的分配（例如两个各 0.04 的并列主要假设对 0.05 的整组预算会被拒绝）。校验在任何落盘之前完成，被拒绝的计划不会写入批次，库中已有批次与探索结果原样保留；错误信息会列出冲突的各项及其份额。
+
+一个后续项也可以声明多个父假设（`parent` 为列表）。此时必须预先声明 `parent_mode`：`"all"` 表示全部父假设都满足开放条件才打开，任一父假设失败即关闭；`"any"` 表示任一父假设满足即打开，全部父假设都失败才关闭。无论经由几条路径打开，同一后续项只获得自己声明的一份 `risk_share` 与一份正式额度，不会因多条路径先后打开而重复领用；打开记录（`gate_opened_via`）只写一次。
+
+每项假设还可以预先声明 `reallocate_to`，规定自己失败（正式不显著）或关闭后未用份额的去向。转移只发生一次并落盘到 `share_transfers`；已经用于正式显著判断的份额永远不可回收，撤回显示或重新打开试验都不会让它再次可用。接收方的可用额度为自有份额加上全部转入份额。
+
 后续假设在父假设正式满足条件前保持 `pending`，`peek` 只显示探索状态，直接运行未开放假设会报错；父假设失败时依赖项变为不可变的 `closed`，暂停恢复或重开试验都不能绕过该条件。已经开放的假设才保存并正式判断自己的证据，未开放阶段的观察不会计入调整结论。
 
 `compare` 的 `family.gate_paths` 对每条开放路径列出：运行前 `preplanned_allocation`、`planned_risk_share`、已经由正式拒绝使用的 `used_risk_share`、剩余份额以及最终可作出的正式结论。追加计算预算只延长证据收集，不会改变预先固定的门控、分配或错误风险。
+
+`compare` 的 `family.risk_ledger` 逐项列出每个假设的 `initial_allocation`、`transfers_in` / `transfers_out`（来源、去向、金额、原因）、`effective_allocation`、`used_risk_share` 与 `remaining_risk_share`，用于逐项核对不同开放顺序与共享后续项配置下的初始分配、转移、已用和剩余额度；层级假设的正式判断（`adjusted_reject`）按转移后的有效份额作出。
 
 Python 示例：
 

@@ -53,6 +53,11 @@ class PlatformRunner:
         seed: int | None = None,
         family_alpha: float = 0.05,
     ) -> int:
+        spec_list = tuple(specs or ())
+        gates = gates_for_specs(spec_list)
+        # Validate the whole confirmation family before persisting anything, so
+        # a rejected plan leaves existing batches and exploratory results intact.
+        validate_gates(gates, family_alpha)
         dataset_id = self._store_dataset(dataset)
         batch_id = self.store.insert(
             "batches",
@@ -67,9 +72,6 @@ class PlatformRunner:
             "batch_states",
             {"batch_id": batch_id, "rng_state_json": None, "random_draws": 0},
         )
-        spec_list = tuple(specs or ())
-        gates = gates_for_specs(spec_list)
-        validate_gates(gates, family_alpha)
         for index, spec in enumerate(spec_list):
             self.add_test(
                 batch_id,
@@ -104,10 +106,15 @@ class PlatformRunner:
                 "max_exact_assignments": max_exact_assignments,
                 "hypothesis_key": gate.key if gate is not None else None,
                 "parent_hypothesis": gate.parent if gate is not None else None,
+                "parent_hypotheses_json": dumps(list(gate.parents))
+                if gate is not None
+                else None,
+                "parent_mode": gate.parent_mode if gate is not None else None,
+                "reallocate_to": gate.reallocate_to if gate is not None else None,
                 "risk_share": gate.risk_share if gate is not None else None,
             },
         )
-        initial_status = "open" if gate is None or gate.parent is None else "pending"
+        initial_status = "open" if gate is None or not gate.parents else "pending"
         self.store.insert(
             "run_states",
             {
@@ -118,6 +125,7 @@ class PlatformRunner:
                 "rng_state_json": None,
                 "gate_status": initial_status,
                 "gate_opened_at": 0,
+                "gate_opened_via_json": None,
                 "formal_evaluated_start": 0,
                 "exploratory_evaluated": 0,
                 "exploratory_hits": 0,
@@ -146,8 +154,6 @@ class PlatformRunner:
                 if status == "pending":
                     if self._open_dependent(test_id):
                         progressed = True
-                    else:
-                        completed.add(test_id)
                     continue
                 if status == "closed":
                     completed.add(test_id)
@@ -589,37 +595,146 @@ class PlatformRunner:
         }
         changed = False
         for test in tests.values():
-            parent_key = test.get("parent_hypothesis")
-            if parent_key is None:
+            parent_keys = self._parent_keys(test)
+            if not parent_keys:
                 continue
             state = self.store.find_one("run_states", test_id=int(test["id"]))
             if state.get("gate_status") != "pending":
                 continue
-            parent = tests[parent_key]
-            completed = self.store.find_one("test_results", test_id=int(parent["id"]))
-            if completed is None:
-                continue
-            parent_result = self._result_from_dict(loads(completed["result_json"]))
             settings = loads(test["settings_json"])
             gate = HypothesisGate.from_settings(settings, int(test["id"]) - 1)
-            opened = gate_is_opened_by(
-                gate,
-                parent_result,
-                p_value=parent_result.p_value,
-            )
+            outcomes: list[bool | None] = []
+            for parent_key in parent_keys:
+                parent = tests[parent_key]
+                completed = self.store.find_one("test_results", test_id=int(parent["id"]))
+                if completed is None:
+                    outcomes.append(None)
+                    continue
+                parent_result = self._result_from_dict(loads(completed["result_json"]))
+                outcomes.append(
+                    gate_is_opened_by(gate, parent_result, p_value=parent_result.p_value)
+                )
+            mode = gate.parent_mode if gate is not None else "all"
+            if mode == "any":
+                if any(outcome is True for outcome in outcomes):
+                    new_status = "open"
+                elif all(outcome is not None for outcome in outcomes):
+                    new_status = "closed"
+                else:
+                    continue
+            else:
+                if any(outcome is False for outcome in outcomes):
+                    new_status = "closed"
+                elif all(outcome is True for outcome in outcomes):
+                    new_status = "open"
+                else:
+                    continue
+            opened_via = [
+                parent_key
+                for parent_key, outcome in zip(parent_keys, outcomes)
+                if outcome is True
+            ]
             state.update(
                 {
-                    "gate_status": "open" if opened else "closed",
+                    "gate_status": new_status,
+                    "gate_opened_via_json": dumps(opened_via)
+                    if new_status == "open"
+                    else None,
                     "gate_opened_at": int(
                         self.store.find_one("run_states", test_id=int(parent["id"]))[
                             "evaluated_assignments"
                         ]
-                    ) if opened else 0,
+                    )
+                    if new_status == "open"
+                    else 0,
                 }
             )
             changed = True
         if changed:
             self.store.commit()
+        self._apply_share_transfers(batch_id)
+
+    @staticmethod
+    def _parent_keys(test: dict[str, Any]) -> list[str]:
+        stored = test.get("parent_hypotheses_json")
+        if stored:
+            return list(loads(stored))
+        single = test.get("parent_hypothesis")
+        return [single] if single is not None else []
+
+    @staticmethod
+    def _used_share(
+        test: dict[str, Any],
+        result: PermutationResult,
+        share: float | None = None,
+    ) -> float:
+        # Share already consumed by a formal decision; it never becomes
+        # reusable, even if a display is withdrawn or a test is reopened.
+        if share is None:
+            share = float(test.get("risk_share") or 0.0)
+        decision = result.decision
+        if decision is None:
+            decision = "significant" if result.p_value <= share else "not-significant"
+        if decision == "significant":
+            design = result.design or {}
+            return float(design.get("risk_significant_at_q0", share))
+        return 0.0
+
+    def _apply_share_transfers(self, batch_id: int) -> None:
+        # Move predeclared unused shares of failed/closed hypotheses exactly
+        # once. A hypothesis may declare reallocate_to in its hierarchy
+        # settings; when it closes without opening or finishes with a formal
+        # not-significant decision, the unused part of its share moves to the
+        # declared target. Shares spent on a formal significant decision are
+        # never released again.
+        changed = False
+        for row in self.store.find_many("tests", batch_id=batch_id):
+            source_key = row.get("hypothesis_key")
+            target_key = row.get("reallocate_to")
+            if source_key is None or target_key is None:
+                continue
+            existing = self.store.find_one(
+                "share_transfers", batch_id=batch_id, source_key=source_key
+            )
+            if existing is not None:
+                continue
+            state = self.store.find_one("run_states", test_id=int(row["id"]))
+            status = state.get("gate_status", "open")
+            share = float(row.get("risk_share") or 0.0)
+            completed = self.store.find_one("test_results", test_id=int(row["id"]))
+            if status == "closed":
+                used = 0.0
+                reason = "gate-closed"
+            elif completed is not None:
+                result = self._result_from_dict(loads(completed["result_json"]))
+                received = self._transfers_by_target(batch_id).get(source_key, [])
+                effective = share + sum(float(item["amount"]) for item in received)
+                used = self._used_share(row, result, effective)
+                reason = "decision-not-significant"
+            else:
+                continue
+            amount = share - used
+            if amount <= 1e-12:
+                continue
+            self.store.insert(
+                "share_transfers",
+                {
+                    "batch_id": batch_id,
+                    "source_key": source_key,
+                    "target_key": target_key,
+                    "amount": amount,
+                    "reason": reason,
+                },
+            )
+            changed = True
+        if changed:
+            self.store.commit()
+
+    def _transfers_by_target(self, batch_id: int) -> dict[str, list[dict[str, Any]]]:
+        received: dict[str, list[dict[str, Any]]] = {}
+        for transfer in self.store.find_many("share_transfers", batch_id=batch_id):
+            received.setdefault(transfer["target_key"], []).append(transfer)
+        return received
 
     def compare_batch(
         self,
@@ -635,6 +750,21 @@ class PlatformRunner:
         if not rows:
             raise KeyError(f"unknown batch {batch_id}")
         batch_row = self.store.find_one("batches", id=batch_id)
+        self._apply_share_transfers(batch_id)
+        transfers = self.store.find_many("share_transfers", batch_id=batch_id)
+        transfers_in: dict[str, list[dict[str, Any]]] = {}
+        transfers_out: dict[str, list[dict[str, Any]]] = {}
+        for transfer in transfers:
+            transfers_in.setdefault(transfer["target_key"], []).append(transfer)
+            transfers_out.setdefault(transfer["source_key"], []).append(transfer)
+        effective_share: dict[str, float] = {}
+        for row in rows:
+            key = row.get("hypothesis_key")
+            if key is None:
+                continue
+            effective_share[key] = float(row.get("risk_share") or 0.0) + sum(
+                float(item["amount"]) for item in transfers_in.get(key, [])
+            )
         all_items = []
         for row in rows:
             test_id = int(row["id"])
@@ -685,6 +815,11 @@ class PlatformRunner:
             p_adj = adjusted_by_id.get(item.test_id, result.p_value)
             is_hierarchical = row.get("hypothesis_key") is not None
             allocated_share = row.get("risk_share")
+            if is_hierarchical:
+                allocated_share = effective_share.get(
+                    row["hypothesis_key"],
+                    float(allocated_share or 0.0),
+                )
             adjusted_reject = (
                 result.p_value <= float(allocated_share)
                 if is_hierarchical and allocated_share is not None
@@ -714,6 +849,7 @@ class PlatformRunner:
                     "formal_status": "formal",
                     "risk_share": row.get("risk_share"),
                     "allocated_risk_share": allocated_share,
+                    "effective_risk_share": allocated_share if is_hierarchical else None,
                     "null_hypothesis": item.null_hypothesis,
                     "method": result.method,
                     "adaptive": result.adaptive,
@@ -760,6 +896,48 @@ class PlatformRunner:
             outcomes[key] = {"status": status, "result": item.result if item is not None else None}
         family_alpha = float(batch_row.get("family_alpha", alpha))
         gate_paths = path_risk_summaries(gate_records, outcomes, family_alpha)
+        risk_ledger = []
+        for row, item, _ in all_items:
+            key = row.get("hypothesis_key")
+            if key is None:
+                continue
+            state = self.store.find_one("run_states", test_id=int(row["id"]))
+            initial_share = float(row.get("risk_share") or 0.0)
+            received = transfers_in.get(key, [])
+            sent = transfers_out.get(key, [])
+            result = item.result if item is not None else None
+            effective = effective_share[key]
+            used = (
+                self._used_share(row, result, effective) if result is not None else 0.0
+            )
+            released = sum(float(transfer["amount"]) for transfer in sent)
+            risk_ledger.append(
+                {
+                    "hypothesis": key,
+                    "test_id": int(row["id"]),
+                    "gate_status": state.get("gate_status", "open"),
+                    "initial_allocation": initial_share,
+                    "transfers_in": [
+                        {
+                            "from": transfer["source_key"],
+                            "amount": float(transfer["amount"]),
+                            "reason": transfer["reason"],
+                        }
+                        for transfer in received
+                    ],
+                    "transfers_out": [
+                        {
+                            "to": transfer["target_key"],
+                            "amount": float(transfer["amount"]),
+                            "reason": transfer["reason"],
+                        }
+                        for transfer in sent
+                    ],
+                    "effective_allocation": effective,
+                    "used_risk_share": used,
+                    "remaining_risk_share": max(0.0, effective - used - released),
+                }
+            )
         family = {
             "number_of_tests": len(rows),
             "regular_test_count": m,
@@ -774,6 +952,7 @@ class PlatformRunner:
             ],
             "closed_test_ids": [e["test_id"] for e in entries if e.get("gate_status") == "closed"],
             "gate_paths": gate_paths,
+            "risk_ledger": risk_ledger,
             "family_rejected_count": len(family_rejected),
             "family_rejected_test_ids": [entry["test_id"] for entry in family_rejected],
             "all_individual_decisions_made": len(decided) == len(formal_items),
