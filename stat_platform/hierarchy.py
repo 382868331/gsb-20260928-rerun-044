@@ -65,9 +65,26 @@ def validate_gates(gates: Sequence[HypothesisGate | None], family_alpha: float =
         if gate.risk_share is None or not 0.0 < gate.risk_share <= family_alpha + 1e-12:
             raise ValueError("risk_share must lie in (0, family_alpha]")
         if gate.parents:
+            seen_parents: set[str] = set()
+            duplicate_parents: list[str] = []
             for parent in gate.parents:
                 if parent not in key_set:
                     raise ValueError(f"unknown parent hypothesis {parent}")
+                if parent in seen_parents and parent not in duplicate_parents:
+                    duplicate_parents.append(parent)
+                seen_parents.add(parent)
+            if duplicate_parents:
+                counts = ", ".join(
+                    f"{parent} appears {gate.parents.count(parent)} times"
+                    for parent in duplicate_parents
+                )
+                ordered = ", ".join(gate.parents)
+                raise ValueError(
+                    f"hypothesis {gate.key} declares duplicate parent sources in "
+                    f"its parents list [{ordered}]: {counts}; each parent "
+                    f"hypothesis can be declared only once for the same node "
+                    f"(distinct parent nodes may still share a successor)"
+                )
             if gate.open_when is None:
                 raise ValueError("a dependent hypothesis needs open_when")
             if len(gate.parents) > 1 and not gate.parent_mode_explicit:

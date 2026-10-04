@@ -195,6 +195,129 @@ class CheckMultiParentGates:
         assert records[1] == records[3] == records[5]
 
 
+class CheckDuplicateParentDeclarations:
+    @pytest.mark.parametrize(
+        "parents",
+        [
+            ["P1", "P1"],
+            ["P1", "P2", "P1"],
+            ["P2", "P1", "P2", "P1"],
+        ],
+    )
+    def test_repeated_parent_for_one_node_is_rejected_and_located(
+        self, tmp_path: Path, parents: list[str]
+    ):
+        db = tmp_path / "db.json"
+        specs = [
+            gated_spec("P1", "less", share=0.2),
+            gated_spec("P2", "two-sided", share=0.2),
+            gated_spec(
+                "F",
+                "less",
+                share=0.2,
+                parents=parents,
+                threshold=0.4,
+                parent_mode="all",
+            ),
+        ]
+        with PlatformRunner(db) as runner:
+            with pytest.raises(ValueError, match="duplicate parent") as excinfo:
+                create(runner, specs, family_alpha=0.6)
+        message = str(excinfo.value)
+        # The error names the offending hypothesis node and the repeated source.
+        assert "F" in message
+        assert "P1" in message
+        with PlatformRunner(db) as runner:
+            # A rejected plan persists nothing; the error cannot reach any
+            # later allocation computation.
+            assert runner.store.find_many("batches") == []
+
+    def test_distinct_parents_sharing_a_successor_remain_legal(self, tmp_path: Path):
+        specs = [
+            gated_spec("P1", "less", share=0.2),
+            gated_spec("P2", "two-sided", share=0.2),
+            gated_spec(
+                "F",
+                "less",
+                share=0.2,
+                parents=["P1", "P2"],
+                threshold=0.4,
+                parent_mode="any",
+            ),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            batch_id = create(runner, specs, family_alpha=0.6)
+            run_fully(runner, batch_id)
+            report = runner.compare_batch(batch_id)
+            tests = {
+                row["hypothesis_key"]: row
+                for row in runner.store.find_many("tests", batch_id=batch_id)
+            }
+            state = runner.store.find_one("run_states", test_id=tests["F"]["id"])
+        assert state["gate_status"] == "open"
+        # Two distinct parents contribute one shared gate path each, not two
+        # copies of the same parent edge.
+        assert sorted(
+            tuple(item["path"]) for item in report["family"]["gate_paths"]
+        ) == [("P1", "F"), ("P2", "F")]
+
+    def test_two_node_gate_cycle_is_rejected(self, tmp_path: Path):
+        specs = [
+            gated_spec(
+                "A",
+                "less",
+                share=0.2,
+                parents=["B"],
+                threshold=0.4,
+            ),
+            gated_spec(
+                "B",
+                "less",
+                share=0.2,
+                parents=["A"],
+                threshold=0.4,
+            ),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            with pytest.raises(ValueError, match="hypothesis gates") as excinfo:
+                create(runner, specs, family_alpha=0.6)
+        message = str(excinfo.value)
+        assert "A -> B -> A" in message
+        assert "A->B" in message and "B->A" in message
+
+    def test_legal_chain_history_is_not_inflated_by_repeat_reads_or_resume(
+        self, tmp_path: Path
+    ):
+        db = tmp_path / "db.json"
+        specs = [
+            gated_spec("A", "two-sided", share=0.2, reallocate_to="B"),
+            gated_spec("B", "two-sided", share=0.2, reallocate_to="C"),
+            gated_spec("C", "less", share=0.2),
+        ]
+        with PlatformRunner(db) as runner:
+            batch_id = create(runner, specs, family_alpha=0.6)
+            run_fully(runner, batch_id)
+            first = runner.compare_batch(batch_id)
+            second = runner.compare_batch(batch_id)
+            transfers = [
+                (item["source_key"], item["target_key"], item["amount"])
+                for item in runner.store.find_many("share_transfers", batch_id=batch_id)
+            ]
+        assert first["family"]["risk_ledger"] == second["family"]["risk_ledger"]
+        assert transfers == [("A", "B", pytest.approx(0.2)), ("B", "C", pytest.approx(0.4))]
+
+        # Reopening the database (recovery) must not re-read or re-insert any
+        # already persisted allocation.
+        with PlatformRunner(db) as runner:
+            third = runner.compare_batch(batch_id)
+            recovered = [
+                (item["source_key"], item["target_key"], item["amount"])
+                for item in runner.store.find_many("share_transfers", batch_id=batch_id)
+            ]
+        assert third["family"]["risk_ledger"] == first["family"]["risk_ledger"]
+        assert recovered == transfers
+
+
 class CheckShareReallocation:
     def plan(self) -> list[TestSpec]:
         return [
