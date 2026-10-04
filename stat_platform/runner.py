@@ -15,7 +15,9 @@ from .hierarchy import (
     gates_for_specs,
     gate_is_opened_by,
     path_risk_summaries,
+    reallocation_edges,
     validate_gates,
+    validate_reallocation_routes,
 )
 from .models import Dataset, PermutationResult, TestResult, TestSpec
 from .permutation import AssignmentRecord, GroupedPermutationTest
@@ -59,6 +61,7 @@ class PlatformRunner:
         # a rejected plan leaves existing batches and exploratory results intact.
         validate_gates(gates, family_alpha)
         dataset_id = self._store_dataset(dataset)
+        routes = reallocation_edges(gates)
         batch_id = self.store.insert(
             "batches",
             {
@@ -66,6 +69,8 @@ class PlatformRunner:
                 "name": name or f"{dataset.name}:{dataset.version}",
                 "seed": seed,
                 "family_alpha": family_alpha,
+                "reallocation_routes_json": dumps(routes),
+                "route_version": 1,
             },
         )
         self.store.insert(
@@ -94,6 +99,10 @@ class PlatformRunner:
         seed: int | None = None,
         gate: HypothesisGate | None = None,
     ) -> int:
+        if gate is None:
+            gate = HypothesisGate.from_settings(dict(spec.settings), 0)
+        if gate is not None and gate.reallocate_to is not None:
+            self._extend_reallocation_routes(batch_id, gate)
         test_id = self.store.insert(
             "tests",
             {
@@ -133,6 +142,50 @@ class PlatformRunner:
         )
         self.store.commit()
         return test_id
+
+    def _batch_routes(self, batch_id: int) -> tuple[dict[str, str], int]:
+        """Persisted routing plan and its version for a batch.
+
+        The plan is stored when the batch is created and only ever extended
+        through validated additions; batches saved before routing versions
+        existed fall back to the edges recorded on their test rows.
+        """
+        batch = self.store.find_one("batches", id=batch_id)
+        stored = batch.get("reallocation_routes_json")
+        if stored is not None:
+            return dict(loads(stored)), int(batch.get("route_version") or 1)
+        routes = {
+            row["hypothesis_key"]: row["reallocate_to"]
+            for row in self.store.find_many("tests", batch_id=batch_id)
+            if row.get("hypothesis_key") is not None and row.get("reallocate_to")
+        }
+        return routes, 1
+
+    def _extend_reallocation_routes(self, batch_id: int, gate: HypothesisGate) -> None:
+        routes, version = self._batch_routes(batch_id)
+        existing_target = routes.get(gate.key)
+        if existing_target is not None:
+            if existing_target == gate.reallocate_to:
+                return
+            raise ValueError(
+                f"reallocation route for {gate.key} is already recorded as "
+                f"{gate.key}->{existing_target} (route version {version}); a "
+                "saved plan cannot be retroactively rewritten"
+            )
+        known_keys = {
+            row["hypothesis_key"]
+            for row in self.store.find_many("tests", batch_id=batch_id)
+            if row.get("hypothesis_key") is not None
+        }
+        known_keys.add(gate.key)
+        if gate.reallocate_to not in known_keys:
+            raise ValueError(f"unknown reallocation target {gate.reallocate_to}")
+        candidate = {**routes, gate.key: gate.reallocate_to}
+        validate_reallocation_routes(candidate)
+        batch = self.store.find_one("batches", id=batch_id)
+        batch["reallocation_routes_json"] = dumps(candidate)
+        batch["route_version"] = version + 1
+        self.store.commit()
 
     def run_batch(
         self,
@@ -687,16 +740,24 @@ class PlatformRunner:
         # not-significant decision, the unused part of its share moves to the
         # declared target. Shares spent on a formal significant decision are
         # never released again.
+        routes, route_version = self._batch_routes(batch_id)
         changed = False
         for row in self.store.find_many("tests", batch_id=batch_id):
             source_key = row.get("hypothesis_key")
-            target_key = row.get("reallocate_to")
+            target_key = routes.get(source_key) if source_key is not None else None
             if source_key is None or target_key is None:
                 continue
             existing = self.store.find_one(
                 "share_transfers", batch_id=batch_id, source_key=source_key
             )
             if existing is not None:
+                if existing["target_key"] != target_key:
+                    raise RuntimeError(
+                        f"recorded transfer {source_key}->"
+                        f"{existing['target_key']} conflicts with route version "
+                        f"{route_version} ({source_key}->{target_key}); saved "
+                        "transfer evidence is never rewritten"
+                    )
                 continue
             state = self.store.find_one("run_states", test_id=int(row["id"]))
             status = state.get("gate_status", "open")
@@ -724,6 +785,7 @@ class PlatformRunner:
                     "target_key": target_key,
                     "amount": amount,
                     "reason": reason,
+                    "route_version": route_version,
                 },
             )
             changed = True
@@ -751,6 +813,7 @@ class PlatformRunner:
             raise KeyError(f"unknown batch {batch_id}")
         batch_row = self.store.find_one("batches", id=batch_id)
         self._apply_share_transfers(batch_id)
+        routes, route_version = self._batch_routes(batch_id)
         transfers = self.store.find_many("share_transfers", batch_id=batch_id)
         transfers_in: dict[str, list[dict[str, Any]]] = {}
         transfers_out: dict[str, list[dict[str, Any]]] = {}
@@ -953,6 +1016,13 @@ class PlatformRunner:
             "closed_test_ids": [e["test_id"] for e in entries if e.get("gate_status") == "closed"],
             "gate_paths": gate_paths,
             "risk_ledger": risk_ledger,
+            "reallocation_routes": {
+                "version": route_version,
+                "edges": [
+                    {"from": source, "to": target}
+                    for source, target in sorted(routes.items())
+                ],
+            },
             "family_rejected_count": len(family_rejected),
             "family_rejected_test_ids": [entry["test_id"] for entry in family_rejected],
             "all_individual_decisions_made": len(decided) == len(formal_items),

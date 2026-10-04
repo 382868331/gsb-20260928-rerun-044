@@ -101,6 +101,60 @@ def validate_gates(gates: Sequence[HypothesisGate | None], family_alpha: float =
             "risk shares of parallel primary hypotheses exceed the family budget: "
             f"{detail} sum to {root_total:g} > family alpha {family_alpha:g}"
         )
+    validate_reallocation_routes(reallocation_edges(declared))
+
+
+def reallocation_edges(gates: Sequence[HypothesisGate | None]) -> dict[str, str]:
+    """Declared quota-routing edges: source hypothesis -> reallocation target."""
+    edges: dict[str, str] = {}
+    for gate in gates:
+        if gate is None or gate.reallocate_to is None:
+            continue
+        if gate.key in edges:
+            raise ValueError(
+                "duplicate reallocation source "
+                f"{gate.key}: each hypothesis may route its share along exactly "
+                "one edge"
+            )
+        edges[gate.key] = gate.reallocate_to
+    return edges
+
+
+def find_reallocation_cycle(edges: dict[str, str]) -> list[str] | None:
+    """Return the nodes of a routing cycle (closed, start repeated) if any."""
+    for start in edges:
+        seen: dict[str, int] = {}
+        path: list[str] = []
+        node = start
+        while node in edges:
+            if node in seen:
+                return path[seen[node] :] + [node]
+            seen[node] = len(path)
+            path.append(node)
+            node = edges[node]
+    return None
+
+
+def validate_reallocation_routes(edges: dict[str, str]) -> None:
+    """Reject circular quota routing before any transfer is executed.
+
+    Every node has at most one outgoing edge, so any cycle would let a closed
+    hypothesis receive its own share back through a loop (e.g. R1 -> R2 ->
+    R1). That propagation is ambiguous no matter how small each node's share
+    is, so it is rejected at plan time with the exact nodes and edges named.
+    """
+    cycle = find_reallocation_cycle(edges)
+    if cycle is None:
+        return
+    nodes = " -> ".join(cycle)
+    edge_list = ", ".join(
+        f"{source}->{target}" for source, target in zip(cycle, cycle[1:])
+    )
+    raise ValueError(
+        f"reallocation cycle detected: {nodes}; involved edges: {edge_list}. "
+        "Circular quota routing is rejected regardless of how small each "
+        "node's share is; break the cycle by removing one of these edges."
+    )
 
 
 def enumerate_root_paths(declared: Sequence[HypothesisGate]) -> list[list[str]]:
