@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from stat_platform import Dataset, GroupedPermutationTest, PlatformRunner, TestSpec
+from stat_platform.storage import dumps, loads
 
 
 def triple_dataset() -> Dataset:
@@ -193,6 +194,168 @@ class CheckMultiParentGates:
                 )
         assert records[0] == records[2] == records[4]
         assert records[1] == records[3] == records[5]
+
+
+class CheckDuplicateParentSources:
+    def test_duplicate_parent_on_one_node_is_rejected_and_located(self, tmp_path: Path):
+        # Ordering of the duplicated entries must not hide the error.
+        for ordering in (["P1", "P1", "P2"], ["P2", "P1", "P1"], ["P1", "P2", "P1"]):
+            specs = [
+                gated_spec("P1", "less", share=0.2),
+                gated_spec("P2", "two-sided", share=0.2),
+                gated_spec(
+                    "F",
+                    "less",
+                    share=0.2,
+                    parents=ordering,
+                    threshold=0.4,
+                    parent_mode="all",
+                ),
+            ]
+            with PlatformRunner(tmp_path / f"{len(ordering)}.json") as runner:
+                with pytest.raises(ValueError, match="duplicate parent") as excinfo:
+                    create(runner, specs)
+            message = str(excinfo.value)
+            assert "F" in message and "P1" in message
+
+    def test_duplicate_parent_is_rejected_before_anything_is_persisted(self, tmp_path: Path):
+        db = tmp_path / "db.json"
+        specs = [
+            gated_spec("P1", "less", share=0.2),
+            gated_spec(
+                "F",
+                "less",
+                share=0.2,
+                parents=["P1", "P1"],
+                threshold=0.4,
+                parent_mode="all",
+            ),
+        ]
+        with PlatformRunner(db) as runner:
+            with pytest.raises(ValueError, match="duplicate parent source"):
+                create(runner, specs)
+            # Validation runs before any insert: no dataset, batch, or test rows.
+            assert runner.store.find_many("batches") == []
+            assert runner.store.find_many("tests") == []
+            assert runner.store.find_many("datasets") == []
+
+    def test_distinct_parents_sharing_a_successor_remain_legal(self, tmp_path: Path):
+        specs = [
+            gated_spec("P1", "less", share=0.35),
+            gated_spec("P2", "two-sided", share=0.2),
+            gated_spec(
+                "SHARED",
+                "less",
+                share=0.2,
+                parents=["P1", "P2"],
+                threshold=0.4,
+                parent_mode="any",
+            ),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            batch_id = create(runner, specs)
+            run_fully(runner, batch_id)
+            tests = {
+                row["hypothesis_key"]: row
+                for row in runner.store.find_many("tests", batch_id=batch_id)
+            }
+            state = runner.store.find_one("run_states", test_id=tests["SHARED"]["id"])
+            assert state["gate_status"] == "open"
+            # Two distinct parents share one successor: it opens once and
+            # evaluates its own single allocation exactly once.
+            assert state["gate_opened_via_json"] == '["P1"]'
+            assert state["evaluated_assignments"] == 8
+
+    def test_two_node_gate_cycle_is_rejected_with_nodes_and_edges(self, tmp_path: Path):
+        specs = [
+            gated_spec("A", "less", share=0.2, parents=["B"], threshold=0.4, parent_mode="all"),
+            gated_spec("B", "less", share=0.2, parents=["A"], threshold=0.4, parent_mode="all"),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            with pytest.raises(ValueError, match="hypothesis gates") as excinfo:
+                create(runner, specs)
+            assert runner.store.find_many("batches") == []
+        message = str(excinfo.value)
+        assert "A -> B -> A" in message or "B -> A -> B" in message
+        assert "A->B" in message and "B->A" in message
+
+    def test_legal_parent_chain_still_runs(self, tmp_path: Path):
+        specs = [
+            gated_spec("P1", "less", share=0.2),
+            gated_spec("F1", "less", share=0.2, parents=["P1"], threshold=0.4),
+            gated_spec(
+                "F2",
+                "less",
+                share=0.2,
+                parents=["P1", "F1"],
+                threshold=0.4,
+                parent_mode="any",
+            ),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            batch_id = create(runner, specs, family_alpha=0.6)
+            run_fully(runner, batch_id)
+            report = runner.compare_batch(batch_id)
+        statuses = {
+            item["hypothesis"]: item["gate_status"] for item in report["tests"]
+        }
+        assert statuses == {"P1": "open", "F1": "open", "F2": "open"}
+        # Each distinct gate edge appears on its own path; no edge is doubled.
+        paths = sorted(tuple(path) for path in [p["path"] for p in report["family"]["gate_paths"]])
+        assert paths == [("P1", "F1", "F2"), ("P1", "F2")]
+
+    def test_legacy_persisted_duplicate_parents_do_not_double_count_on_resume(
+        self, tmp_path: Path
+    ):
+        # Simulate a batch written before duplicate parents were rejected:
+        # the stored plan repeats P1, but resuming must treat it once.
+        db = tmp_path / "db.json"
+        specs = [
+            gated_spec("P1", "less", share=0.35),
+            gated_spec("P2", "two-sided", share=0.2),
+            gated_spec(
+                "F",
+                "less",
+                share=0.2,
+                parents=["P1", "P2"],
+                threshold=0.4,
+                parent_mode="any",
+            ),
+        ]
+        with PlatformRunner(db) as runner:
+            batch_id = create(runner, specs)
+            follow_up = next(
+                row
+                for row in runner.store.find_many("tests", batch_id=batch_id)
+                if row["hypothesis_key"] == "F"
+            )
+            follow_up["parent_hypotheses_json"] = dumps(["P1", "P1", "P2"])
+            settings = loads(follow_up["settings_json"])
+            settings["hierarchy"]["parent"] = ["P1", "P1", "P2"]
+            follow_up["settings_json"] = dumps(settings)
+            runner.store.commit()
+            run_fully(runner, batch_id)
+            first = runner.compare_batch(batch_id)
+            state = runner.store.find_one("run_states", test_id=follow_up["id"])
+            assert loads(state["gate_opened_via_json"]) == ["P1"]
+            assert state["evaluated_assignments"] == 8
+
+        with PlatformRunner(db) as runner:
+            # Restore from disk and compare repeatedly: history must not grow.
+            second = runner.compare_batch(batch_id)
+            third = runner.compare_batch(batch_id)
+            tests = {
+                row["hypothesis_key"]: row
+                for row in runner.store.find_many("tests", batch_id=batch_id)
+            }
+            state = runner.store.find_one("run_states", test_id=tests["F"]["id"])
+        assert loads(state["gate_opened_via_json"]) == ["P1"]
+        assert state["evaluated_assignments"] == 8
+        assert third["family"]["risk_ledger"] == first["family"]["risk_ledger"]
+        assert second["family"]["risk_ledger"] == first["family"]["risk_ledger"]
+        paths = [tuple(item["path"]) for item in third["family"]["gate_paths"]]
+        # P1->F is a single edge despite being stored twice.
+        assert sorted(paths) == [("P1", "F"), ("P2", "F")]
 
 
 class CheckShareReallocation:

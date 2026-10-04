@@ -65,6 +65,19 @@ def validate_gates(gates: Sequence[HypothesisGate | None], family_alpha: float =
         if gate.risk_share is None or not 0.0 < gate.risk_share <= family_alpha + 1e-12:
             raise ValueError("risk_share must lie in (0, family_alpha]")
         if gate.parents:
+            duplicated_parents = _duplicated_entries(gate.parents)
+            if duplicated_parents:
+                # The same parent source listed twice on one node is a
+                # configuration error, not a shared successor: reject it
+                # before any persistence so quota calculation never sees the
+                # edge more than once. Distinct parents pointing at the same
+                # successor remain legal and are unaffected.
+                detail = ", ".join(duplicated_parents)
+                raise ValueError(
+                    f"hypothesis {gate.key} declares duplicate parent source(s) "
+                    f"{detail}; parents={list(gate.parents)} must list each parent "
+                    "at most once"
+                )
             for parent in gate.parents:
                 if parent not in key_set:
                     raise ValueError(f"unknown parent hypothesis {parent}")
@@ -138,6 +151,20 @@ def _ensure_unique_edges(edges: list[tuple[str, str]], label: str) -> None:
         raise ValueError(f"duplicate {label} edges: {detail}")
 
 
+def _duplicated_entries(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for value in values:
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.add(value)
+    return duplicates
+
+
+def _unique_in_order(values: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
 def _ensure_acyclic(
     nodes: Sequence[str],
     edges: Sequence[tuple[str, str]],
@@ -198,7 +225,11 @@ def enumerate_root_paths(declared: Sequence[HypothesisGate]) -> list[list[str]]:
             paths = [[key]]
         else:
             paths = []
-            for parent in gate.parents:
+            # Defensive de-duplication for plans persisted before duplicate
+            # parent sources were rejected at validation time: reading or
+            # restoring such a batch must never count the same gate edge
+            # (and its share) twice.
+            for parent in _unique_in_order(gate.parents):
                 for prefix in paths_to(parent, active | {key}):
                     paths.append(prefix + [key])
         memo[key] = paths

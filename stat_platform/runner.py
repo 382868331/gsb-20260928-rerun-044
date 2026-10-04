@@ -659,7 +659,10 @@ class PlatformRunner:
     def _parent_keys(test: dict[str, Any]) -> list[str]:
         stored = test.get("parent_hypotheses_json")
         if stored:
-            return list(loads(stored))
+            # Older batches may predate the duplicate-parent rejection in
+            # validate_gates. De-duplicate on read so resume/repeated compares
+            # never evaluate, open via, or charge the same parent twice.
+            return list(dict.fromkeys(loads(stored)))
         single = test.get("parent_hypothesis")
         return [single] if single is not None else []
 
