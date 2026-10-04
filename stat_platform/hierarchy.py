@@ -83,6 +83,29 @@ def validate_gates(gates: Sequence[HypothesisGate | None], family_alpha: float =
             if gate.reallocate_to == gate.key:
                 raise ValueError("a hypothesis cannot reallocate its share to itself")
 
+    gate_edges = [
+        (parent, gate.key)
+        for gate in declared
+        for parent in gate.parents
+    ]
+    _ensure_acyclic(
+        keys,
+        gate_edges,
+        "hypothesis gates",
+    )
+
+    reallocation_edges = [
+        (gate.key, gate.reallocate_to)
+        for gate in declared
+        if gate.reallocate_to is not None
+    ]
+    _ensure_unique_edges(reallocation_edges, "reallocation route")
+    _ensure_acyclic(
+        keys,
+        reallocation_edges,
+        "reallocation routes",
+    )
+
     by_key = {gate.key: gate for gate in declared}
     for path in enumerate_root_paths(declared):
         shares = [by_key[key].risk_share or 0.0 for key in path]
@@ -101,6 +124,63 @@ def validate_gates(gates: Sequence[HypothesisGate | None], family_alpha: float =
             "risk shares of parallel primary hypotheses exceed the family budget: "
             f"{detail} sum to {root_total:g} > family alpha {family_alpha:g}"
         )
+
+
+def _ensure_unique_edges(edges: list[tuple[str, str]], label: str) -> None:
+    seen: set[tuple[str, str]] = set()
+    duplicates: list[tuple[str, str]] = []
+    for edge in edges:
+        if edge in seen and edge not in duplicates:
+            duplicates.append(edge)
+        seen.add(edge)
+    if duplicates:
+        detail = ", ".join(f"{source}->{target}" for source, target in duplicates)
+        raise ValueError(f"duplicate {label} edges: {detail}")
+
+
+def _ensure_acyclic(
+    nodes: Sequence[str],
+    edges: Sequence[tuple[str, str]],
+    label: str,
+) -> None:
+    outgoing: dict[str, list[str]] = {node: [] for node in nodes}
+    for source, target in edges:
+        outgoing.setdefault(source, []).append(target)
+        outgoing.setdefault(target, [])
+
+    checked: set[str] = set()
+    active: list[str] = []
+    active_set: set[str] = set()
+
+    def visit(node: str) -> list[str] | None:
+        active.append(node)
+        active_set.add(node)
+        for neighbor in outgoing.get(node, []):
+            if neighbor in active_set:
+                start = active.index(neighbor)
+                return active[start:] + [neighbor]
+            if neighbor not in checked:
+                cycle = visit(neighbor)
+                if cycle is not None:
+                    return cycle
+        active.pop()
+        active_set.remove(node)
+        checked.add(node)
+        return None
+
+    for node in nodes:
+        if node in checked:
+            continue
+        cycle = visit(node)
+        if cycle is not None:
+            cycle_edges = [
+                f"{source}->{target}"
+                for source, target in zip(cycle, cycle[1:])
+            ]
+            raise ValueError(
+                f"{label} must not contain cycles: cycle "
+                f"{' -> '.join(cycle)} uses edges {', '.join(cycle_edges)}"
+            )
 
 
 def enumerate_root_paths(declared: Sequence[HypothesisGate]) -> list[list[str]]:

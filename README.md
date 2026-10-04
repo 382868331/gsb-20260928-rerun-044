@@ -26,13 +26,13 @@
 
 一个后续项也可以声明多个父假设（`parent` 为列表）。此时必须预先声明 `parent_mode`：`"all"` 表示全部父假设都满足开放条件才打开，任一父假设失败即关闭；`"any"` 表示任一父假设满足即打开，全部父假设都失败才关闭。无论经由几条路径打开，同一后续项只获得自己声明的一份 `risk_share` 与一份正式额度，不会因多条路径先后打开而重复领用；打开记录（`gate_opened_via`）只写一次。
 
-每项假设还可以预先声明 `reallocate_to`，规定自己失败（正式不显著）或关闭后未用份额的去向。转移只发生一次并落盘到 `share_transfers`；已经用于正式显著判断的份额永远不可回收，撤回显示或重新打开试验都不会让它再次可用。接收方的可用额度为自有份额加上全部转入份额。
+每项假设还可以预先声明 `reallocate_to`，规定自己失败（正式不显著）或关闭后未用份额的去向。创建批次前会把所有转移声明视为独立有向图检查：自环、重复边和有向环都会在任何批次证据写入前拒绝，错误信息列出环上节点与具体边；额度很小也不能让不明确的循环传播通过。合法无环图中多个来源可以指向同一个后续项，但每个来源关闭时只转移一次。转移落盘到 `share_transfers`，并记录创建计划时的 `route_version`；部分执行后恢复会沿用该版本与既有历史转移，重复读取 `compare` 不新增分配，后续计划校验失败也不会追溯改写已有证据。已经用于正式显著判断的份额永远不可回收，撤回显示或重新打开试验都不会让它再次可用。接收方的可用额度为自有份额加上全部转入份额。
 
 后续假设在父假设正式满足条件前保持 `pending`，`peek` 只显示探索状态，直接运行未开放假设会报错；父假设失败时依赖项变为不可变的 `closed`，暂停恢复或重开试验都不能绕过该条件。已经开放的假设才保存并正式判断自己的证据，未开放阶段的观察不会计入调整结论。
 
 `compare` 的 `family.gate_paths` 对每条开放路径列出：运行前 `preplanned_allocation`、`planned_risk_share`、已经由正式拒绝使用的 `used_risk_share`、剩余份额以及最终可作出的正式结论。追加计算预算只延长证据收集，不会改变预先固定的门控、分配或错误风险。
 
-`compare` 的 `family.risk_ledger` 逐项列出每个假设的 `initial_allocation`、`transfers_in` / `transfers_out`（来源、去向、金额、原因）、`effective_allocation`、`used_risk_share` 与 `remaining_risk_share`，用于逐项核对不同开放顺序与共享后续项配置下的初始分配、转移、已用和剩余额度；层级假设的正式判断（`adjusted_reject`）按转移后的有效份额作出。
+`compare` 的 `family.route_version` 报告该批次的路由版本，`family.risk_ledger` 逐项列出每个假设的 `initial_allocation`、`transfers_in` / `transfers_out`（来源、去向、金额、原因）、`effective_allocation`、`used_risk_share` 与 `remaining_risk_share`，用于逐项核对不同开放顺序与共享后续项配置下的初始分配、转移、已用和剩余额度；层级假设的正式判断（`adjusted_reject`）按转移后的有效份额作出。
 
 Python 示例：
 

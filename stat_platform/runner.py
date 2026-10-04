@@ -66,6 +66,7 @@ class PlatformRunner:
                 "name": name or f"{dataset.name}:{dataset.version}",
                 "seed": seed,
                 "family_alpha": family_alpha,
+                "route_version": 1,
             },
         )
         self.store.insert(
@@ -688,6 +689,8 @@ class PlatformRunner:
         # declared target. Shares spent on a formal significant decision are
         # never released again.
         changed = False
+        batch = self.store.find_one("batches", id=batch_id)
+        route_version = int(batch.get("route_version", 1)) if batch is not None else 1
         for row in self.store.find_many("tests", batch_id=batch_id):
             source_key = row.get("hypothesis_key")
             target_key = row.get("reallocate_to")
@@ -713,7 +716,9 @@ class PlatformRunner:
                 reason = "decision-not-significant"
             else:
                 continue
-            amount = share - used
+            received = self._transfers_by_target(batch_id).get(source_key, [])
+            effective = share + sum(float(item["amount"]) for item in received)
+            amount = effective - used
             if amount <= 1e-12:
                 continue
             self.store.insert(
@@ -724,6 +729,7 @@ class PlatformRunner:
                     "target_key": target_key,
                     "amount": amount,
                     "reason": reason,
+                    "route_version": route_version,
                 },
             )
             changed = True
@@ -895,6 +901,7 @@ class PlatformRunner:
             )
             outcomes[key] = {"status": status, "result": item.result if item is not None else None}
         family_alpha = float(batch_row.get("family_alpha", alpha))
+        route_version = int(batch_row.get("route_version", 1))
         gate_paths = path_risk_summaries(gate_records, outcomes, family_alpha)
         risk_ledger = []
         for row, item, _ in all_items:
@@ -942,6 +949,7 @@ class PlatformRunner:
             "number_of_tests": len(rows),
             "regular_test_count": m,
             "planned_family_alpha": family_alpha,
+            "route_version": route_version,
             "rule": rule,
             "family_wise_alpha": alpha,
             "formally_open_count": m,

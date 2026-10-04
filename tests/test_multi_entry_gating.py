@@ -274,6 +274,128 @@ class CheckShareReallocation:
                 create(runner, specs)
 
 
+class CheckReallocationRoutes:
+    def test_two_node_reallocation_cycle_reports_nodes_and_edges(self, tmp_path: Path):
+        specs = [
+            gated_spec("R1", "less", share=0.01, reallocate_to="R2"),
+            gated_spec("R2", "less", share=0.01, reallocate_to="R1"),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            with pytest.raises(ValueError, match="reallocation routes") as excinfo:
+                create(runner, specs, family_alpha=0.05)
+        message = str(excinfo.value)
+        assert "R1 -> R2 -> R1" in message
+        assert "R1->R2" in message and "R2->R1" in message
+        assert runner.store.find_many("batches") == []
+
+    def test_three_node_reallocation_cycle_is_rejected_even_with_small_shares(
+        self, tmp_path: Path
+    ):
+        specs = [
+            gated_spec("R1", "less", share=0.001, reallocate_to="R2"),
+            gated_spec("R2", "less", share=0.001, reallocate_to="R3"),
+            gated_spec("R3", "less", share=0.001, reallocate_to="R1"),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            with pytest.raises(ValueError, match="R1 -> R2 -> R3 -> R1") as excinfo:
+                create(runner, specs, family_alpha=0.05)
+        message = str(excinfo.value)
+        assert "R3->R1" in message
+        assert runner.store.find_many("batches") == []
+
+    def test_shared_successor_and_legal_acyclic_branch_transfer_once(self, tmp_path: Path):
+        specs = [
+            gated_spec("P1", "two-sided", share=0.2, reallocate_to="SHARED"),
+            gated_spec("P2", "two-sided", share=0.2, reallocate_to="SHARED"),
+            gated_spec("P3", "two-sided", share=0.2, reallocate_to="BRANCH"),
+            gated_spec("SHARED", "less", share=0.1),
+            gated_spec("BRANCH", "less", share=0.1),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            batch_id = create(runner, specs, family_alpha=0.8)
+            run_fully(runner, batch_id)
+            report = runner.compare_batch(batch_id)
+            transfers = runner.store.find_many("share_transfers", batch_id=batch_id)
+        by_key = {entry["hypothesis"]: entry for entry in report["family"]["risk_ledger"]}
+        incoming = {
+            item["from"] for item in by_key["SHARED"]["transfers_in"]
+        }
+        assert incoming == {"P1", "P2"}
+        assert by_key["BRANCH"]["transfers_in"] == [
+            {"from": "P3", "amount": pytest.approx(0.2), "reason": "decision-not-significant"}
+        ]
+        assert [(item["source_key"], item["target_key"]) for item in transfers] == [
+            ("P1", "SHARED"),
+            ("P2", "SHARED"),
+            ("P3", "BRANCH"),
+        ]
+        assert len(transfers) == 3
+
+    def test_legal_acyclic_chain_forwards_unused_received_share_once(self, tmp_path: Path):
+        specs = [
+            gated_spec("A", "two-sided", share=0.2, reallocate_to="B"),
+            gated_spec("B", "two-sided", share=0.2, reallocate_to="C"),
+            gated_spec("C", "less", share=0.2),
+        ]
+        with PlatformRunner(tmp_path / "db.json") as runner:
+            batch_id = create(runner, specs, family_alpha=0.6)
+            run_fully(runner, batch_id)
+            report = runner.compare_batch(batch_id)
+            transfers = runner.store.find_many("share_transfers", batch_id=batch_id)
+        by_key = {entry["hypothesis"]: entry for entry in report["family"]["risk_ledger"]}
+        assert by_key["A"]["transfers_out"][0]["amount"] == pytest.approx(0.2)
+        assert by_key["B"]["transfers_out"][0]["amount"] == pytest.approx(0.4)
+        assert by_key["C"]["effective_allocation"] == pytest.approx(0.6)
+        assert [(item["source_key"], item["target_key"]) for item in transfers] == [
+            ("A", "B"),
+            ("B", "C"),
+        ]
+
+    def test_partial_report_and_resume_preserve_route_version_and_transfer_history(
+        self, tmp_path: Path
+    ):
+        db = tmp_path / "db.json"
+        specs = [
+            gated_spec("P1", "less", share=0.35, reallocate_to="F"),
+            gated_spec("P2", "two-sided", share=0.2, reallocate_to="F"),
+            gated_spec("F", "less", share=0.2, parents=["P1"], threshold=0.4),
+        ]
+        with PlatformRunner(db) as runner:
+            batch_id = create(runner, specs)
+            tests = {
+                row["hypothesis_key"]: row
+                for row in runner.store.find_many("tests", batch_id=batch_id)
+            }
+            runner.run_test(tests["P1"]["id"])
+            runner.run_test(tests["P2"]["id"])
+            partial = runner.compare_batch(batch_id)
+            historical = list(runner.store.find_many("share_transfers", batch_id=batch_id))
+            assert partial["family"]["route_version"] == 1
+            assert [(item["source_key"], item["target_key"], item["route_version"]) for item in historical] == [
+                ("P2", "F", 1)
+            ]
+            with pytest.raises(ValueError, match="R1 -> R2 -> R1"):
+                create(
+                    runner,
+                    [
+                        gated_spec("R1", "less", share=0.01, reallocate_to="R2"),
+                        gated_spec("R2", "less", share=0.01, reallocate_to="R1"),
+                    ],
+                )
+            assert runner.store.find_many("share_transfers", batch_id=batch_id) == historical
+
+        with PlatformRunner(db) as runner:
+            run_fully(runner, batch_id)
+            first = runner.compare_batch(batch_id)
+            second = runner.compare_batch(batch_id)
+            transfers = runner.store.find_many("share_transfers", batch_id=batch_id)
+        assert first["family"]["route_version"] == 1
+        assert second["family"]["risk_ledger"] == first["family"]["risk_ledger"]
+        assert [(item["source_key"], item["target_key"], item["route_version"]) for item in transfers] == [
+            ("P2", "F", 1)
+        ]
+
+
 class CheckComputeBudgetKeepsAllocation:
     def test_larger_sample_budget_does_not_change_risk_allocation(self, tmp_path: Path):
         specs = [
