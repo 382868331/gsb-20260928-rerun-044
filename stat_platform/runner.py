@@ -10,6 +10,7 @@ from statistics import NormalDist
 from typing import Any, Sequence
 
 from .adjustment import adjust
+from .allocation import AllocationTarget, study_allocations
 from .hierarchy import (
     HypothesisGate,
     gates_for_specs,
@@ -989,6 +990,81 @@ class PlatformRunner:
             "tests": entries,
             "family": family,
         }
+
+    def study_allocation(
+        self,
+        batch_id: int,
+        *,
+        priorities: Sequence[Sequence[str]] | None = None,
+        extra_routes: Sequence[Sequence[str]] | None = None,
+    ) -> dict[str, Any]:
+        """Read-only risk-quota allocation study for one batch.
+        Compares legal distributions of the fixed family budget across the
+        declared targets, parent open conditions, and allowed transfer routes
+        (declared reallocate_to edges plus any extra_routes), and derives the
+        maximum share each target can receive. Shares already spent on formal
+        decisions are locked in as immutable minimums, so used quota can never
+        be reallocated by a new scheme; the study itself persists nothing and
+        consumes no budget, and previously recorded conclusions stay exactly
+        as they were.
+        """
+        rows = sorted(
+            self.store.find_many("tests", batch_id=batch_id),
+            key=lambda row: int(row["id"]),
+        )
+        if not rows:
+            raise KeyError(f"unknown batch {batch_id}")
+        batch = self.store.find_one("batches", id=batch_id)
+        family_alpha = float(batch.get("family_alpha", 0.05))
+        targets: list[AllocationTarget] = []
+        for row in rows:
+            key = row.get("hypothesis_key")
+            if key is None:
+                continue
+            state = self.store.find_one("run_states", test_id=int(row["id"]))
+            completed = self.store.find_one("test_results", test_id=int(row["id"]))
+            used = 0.0
+            if completed is not None:
+                result = self._result_from_dict(loads(completed["result_json"]))
+                used = self._used_share(row, result)
+            targets.append(
+                AllocationTarget(
+                    key=key,
+                    parents=tuple(self._parent_keys(row)),
+                    used_share=used,
+                    transfer_targets=(
+                        (str(row["reallocate_to"]),)
+                        if row.get("reallocate_to") is not None
+                        else ()
+                    ),
+                    gate_status=state.get("gate_status", "open"),
+                )
+            )
+        if extra_routes:
+            extras: dict[str, list[str]] = {}
+            for route in extra_routes:
+                source, receiver = str(route[0]), str(route[1])
+                extras.setdefault(source, []).append(receiver)
+            targets = [
+                replace(
+                    target,
+                    transfer_targets=target.transfer_targets
+                    + tuple(extras.get(target.key, ())),
+                )
+                for target in targets
+            ]
+        study = study_allocations(targets, family_alpha, priorities=priorities)
+        payload = study.to_dict()
+        payload.update(
+            {
+                "batch_id": batch_id,
+                "route_version": int(batch.get("route_version", 1)),
+                "gate_status": {
+                    target.key: target.gate_status for target in targets
+                },
+            }
+        )
+        return payload
 
     @staticmethod
     def _individual_meaning(result: PermutationResult) -> str:

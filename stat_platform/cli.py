@@ -114,6 +114,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     result = subparsers.add_parser("result", help="show a completed test result")
     result.add_argument("test_id", type=int)
+    allocate = subparsers.add_parser(
+        "allocate",
+        help="read-only study comparing legal risk-quota allocation schemes",
+    )
+    allocate.add_argument("batch_id", type=int)
+    allocate.add_argument(
+        "--priority",
+        action="append",
+        nargs="+",
+        default=None,
+        metavar="KEY",
+        help="candidate priority order listing every hypothesis key; repeatable",
+    )
+    allocate.add_argument(
+        "--route",
+        action="append",
+        nargs=2,
+        default=None,
+        metavar=("FROM", "TO"),
+        help="extra allowed transfer route; repeatable",
+    )
     return parser
 
 
@@ -249,6 +270,18 @@ def main(argv: list[str] | None = None) -> None:
                 json.dumps(
                     runner.compare_batch(
                         args.batch_id, rule=args.rule, alpha=args.alpha
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        elif args.command == "allocate":
+            print(
+                json.dumps(
+                    runner.study_allocation(
+                        args.batch_id,
+                        priorities=args.priority,
+                        extra_routes=args.route,
                     ),
                     ensure_ascii=False,
                     indent=2,
