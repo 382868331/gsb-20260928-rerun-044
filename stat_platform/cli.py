@@ -114,6 +114,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     result = subparsers.add_parser("result", help="show a completed test result")
     result.add_argument("test_id", type=int)
+
+    study = subparsers.add_parser(
+        "study",
+        help="what-if comparison of candidate risk-share allocation schemes",
+    )
+    study.add_argument("batch_id", type=int)
+    study.add_argument(
+        "--schemes",
+        type=Path,
+        required=True,
+        help="JSON list of {'name', 'plan': [hierarchy dicts]} candidate schemes",
+    )
+    study.add_argument("--max-scenarios", type=int, default=4096)
     return parser
 
 
@@ -249,6 +262,22 @@ def main(argv: list[str] | None = None) -> None:
                 json.dumps(
                     runner.compare_batch(
                         args.batch_id, rule=args.rule, alpha=args.alpha
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        elif args.command == "study":
+            with args.schemes.open("r", encoding="utf-8") as handle:
+                schemes = json.load(handle)
+            if isinstance(schemes, dict):
+                schemes = schemes.get("schemes", [schemes])
+            print(
+                json.dumps(
+                    runner.study_allocations(
+                        args.batch_id,
+                        schemes,
+                        max_scenarios=args.max_scenarios,
                     ),
                     ensure_ascii=False,
                     indent=2,

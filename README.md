@@ -36,6 +36,32 @@
 
 `compare` 的 `family.route_version` 报告该批次的路由版本，`family.risk_ledger` 逐项列出每个假设的 `initial_allocation`、`transfers_in` / `transfers_out`（来源、去向、金额、原因）、`effective_allocation`、`used_risk_share` 与 `remaining_risk_share`，用于逐项核对不同开放顺序与共享后续项配置下的初始分配、转移、已用和剩余额度；层级假设的正式判断（`adjusted_reject`）按转移后的有效份额作出。
 
+### 风险额度分配研究（what-if）
+
+在总额度固定的前提下，研究者可以把若干候选分配方案（各自声明待检目标、父节点开放条件与允许的 `reallocate_to` 转移关系）交给平台做纯模拟比较，不消耗任何额度、不落盘任何证据：
+
+```bash
+stat-platform study 1 --schemes schemes.json
+```
+
+```python
+study = runner.study_allocations(batch_id, schemes=[
+    {"name": "priority-shift", "plan": [
+        {"key": "A", "risk_share": 0.2, "reallocate_to": "C"},
+        {"key": "B", "risk_share": 0.2, "reallocate_to": "C"},
+        {"key": "C", "risk_share": 0.2, "parents": ["A", "B"],
+         "parent_mode": "any", "open_when": {"p_value_at_most": 0.4}},
+        {"key": "D", "risk_share": 0.2, "parents": ["C"],
+         "open_when": {"p_value_at_most": 0.6}},
+    ]},
+])
+```
+
+- 平台自动把当前批次的计划作为 `current-plan` 方案一并比较；每个方案先经 `validate_gates` 校验（重复键、重复/成环转移边、路径与根节点总额超限都会在模拟前拒绝，只标记该方案为 `rejected`，不影响其他方案）。
+- 对每个方案枚举全部未决假设的合法结局组合（显著 / 不显著 / 未检验），沿转移边按拓扑序各触发一次做账目合并：菱形依赖里共享后续节点从多个父来源收到的份额按真实账目相加，重复边与循环不会放大任何额度。报告每个目标假设的 `max_effective_allocation` 及取得该最大值的场景、最坏情况总消耗与 `budget_respected`。
+- 已用于正式判断的份额通过 `used_shares` 锁定：候选方案若丢掉已消耗额度的假设、或让其有效额度低于已用份额，即判 `infeasible`；已用额度在任何新方案中都不会被再次分配。部分节点关闭时只有已决节点释放份额，未检验节点不转移也不消耗。
+- 研究结果是纯返回值：重复调用 `study_allocations` 不改变批次库、`route_version` 与既有 `compare` 结论，旧结论始终可按锁定的份额快照追溯。
+
 Python 示例：
 
 ```python

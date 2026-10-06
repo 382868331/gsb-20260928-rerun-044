@@ -990,6 +990,81 @@ class PlatformRunner:
             "family": family,
         }
 
+    def study_allocations(
+        self,
+        batch_id: int,
+        schemes: Sequence[dict[str, Any]],
+        *,
+        max_scenarios: int = 4096,
+    ) -> dict[str, Any]:
+        """Compare candidate risk-share allocation schemes for one batch.
+
+        This is a pure what-if study: it reads the batch's declared hierarchy,
+        locks every share already spent on formal decisions, and simulates the
+        current plan plus each candidate scheme across all legal outcome
+        scenarios. Nothing is written to the store, so untested candidate
+        schemes never consume budget and existing conclusions stay traceable
+        through the returned route version and locked-share snapshot.
+        """
+        from .allocation import study_schemes
+
+        rows = sorted(
+            self.store.find_many("tests", batch_id=batch_id),
+            key=lambda row: int(row["id"]),
+        )
+        if not rows:
+            raise KeyError(f"unknown batch {batch_id}")
+        batch_row = self.store.find_one("batches", id=batch_id)
+        family_alpha = float(batch_row.get("family_alpha", 0.05))
+        route_version = int(batch_row.get("route_version", 1))
+        self._apply_share_transfers(batch_id)
+        transfers_in = self._transfers_by_target(batch_id)
+
+        plan: list[dict[str, Any]] = []
+        used: dict[str, float] = {}
+        decided: dict[str, str] = {}
+        for row in rows:
+            key = row.get("hypothesis_key")
+            if key is None:
+                continue
+            settings = loads(row["settings_json"])
+            hierarchy = settings.get("hierarchy")
+            if hierarchy:
+                plan.append(dict(hierarchy))
+            state = self.store.find_one("run_states", test_id=int(row["id"]))
+            status = state.get("gate_status", "open")
+            completed = self.store.find_one("test_results", test_id=int(row["id"]))
+            if status == "closed":
+                decided[key] = "closed"
+                continue
+            if completed is None:
+                continue
+            result = self._result_from_dict(loads(completed["result_json"]))
+            effective = float(row.get("risk_share") or 0.0) + sum(
+                float(item["amount"]) for item in transfers_in.get(key, [])
+            )
+            decided[key] = (
+                "significant" if result.p_value <= effective else "not-significant"
+            )
+            used[key] = self._used_share(row, result, effective)
+
+        candidates = [{"name": "current-plan", "plan": plan}, *schemes]
+        study = study_schemes(
+            candidates,
+            family_alpha,
+            used_shares=used,
+            decided=decided,
+            max_scenarios=max_scenarios,
+        )
+        return {
+            "batch_id": batch_id,
+            "route_version": route_version,
+            "family_alpha": family_alpha,
+            "locked_used_shares": used,
+            "decided_outcomes": decided,
+            "study": study,
+        }
+
     @staticmethod
     def _individual_meaning(result: PermutationResult) -> str:
         if not result.adaptive or result.decision is None:
